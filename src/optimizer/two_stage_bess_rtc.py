@@ -9,8 +9,8 @@ TOPOLOGY : DC-coupled — Solar SCB → DC-DC → DC Bus ← BESS → PCS → AC
 
 CHANGE LOG (from earlier versions)
 ───────────────────────────────────
-FIX-1  Topology C3: s_c[t] IS restricted by delta (all flows through single PCS).
-       Old wrong code: x_c[t] <= p_max×delta[t]  [s_c was free]
+FIX-1  Topology C3 REVISED: s_c[t] is NOT restricted by delta.
+       Solar→BESS via DC-DC converter is SEPARATE from PCS AC bus.
        Correct code:   x_c[t]+s_c[t] <= p_max×delta[t]
 
 FIX-2  Setpoint formula: bias heuristic clamped to ±RTC_TOL_PCT (±5%).
@@ -222,13 +222,14 @@ class TwoStageBESSRTC:
             # C2: PCS discharge limit
             prob += x_d[t] + c_d[t] <= p_max,                       f"C2_{t}"
 
-            # C3: AC bus mutual exclusion (DC-COUPLED TOPOLOGY — FIX-1)
-            # ALL flows go through the single PCS → s_c shares delta with x_c
-            # Import mode (delta=1): x_c + s_c ≤ p_max  (PCS charges BESS)
-            # Export mode (delta=0): x_d + c_d ≤ p_max  (PCS discharges)
-            #                        s_cd ≤ S_inv        (solar → captive via AC)
-            #                        s_c = 0             (no charging in export mode)
-            prob += x_c[t] + s_c[t]   <= p_max * delta[t],          f"C3a_{t}"
+            # C3: AC bus mutual exclusion
+            # Topology: Solar→DC-DC→DC Bus←BESS→PCS→AC Bus→Grid/Captive
+            # s_c (solar→BESS via DC-DC) is a SEPARATE path from the PCS AC bus.
+            # s_c can flow simultaneously with s_cd (solar splits at DC bus).
+            # Only x_c (grid→BESS via PCS AC) is mutex with export mode.
+            # This allows BESS to recharge from solar surplus during export blocks,
+            # which is physically required for C5 (SOD=EOD=40) to be satisfiable.
+            prob += x_c[t]             <= p_max * delta[t],          f"C3a_{t}"
             prob += x_d[t] + c_d[t]   <= p_max * (1 - delta[t]),    f"C3b_{t}"
             prob += s_cd[t]            <= S_inv * (1 - delta[t]),    f"C3c_{t}"
 
@@ -429,8 +430,8 @@ def reschedule_captive_rtc(params,
         prob += psh[k] >= PSHORT - (scd[k] + cd[k]),          f"PSH_{k}"
         # C2
         prob += cd[k] + xd_k + yd_k <= p_max,                 f"C2_{k}"
-        # C3 (DC-coupled — s_c through PCS, delta applies)
-        prob += xc_k + yc_k + sc[k] <= p_max * dl[k],         f"C3a_{k}"
+        # C3 (s_c via separate DC-DC path — NOT mutex with export)
+        prob += xc_k + yc_k          <= p_max * dl[k],         f"C3a_{k}"
         prob += xd_k + yd_k + cd[k]  <= p_max*(1-dl[k]),      f"C3b_{k}"
         prob += scd[k]                <= S_inv*(1-dl[k]),      f"C3c_{k}"
         # Captive buffer (first 12 blocks)
@@ -583,15 +584,15 @@ def solve_stage2a_rtc(params,
         sc_t = float(s_c_rt[ta]); cd_t = float(c_d_rt[ta])
         pr   = float(rtm_adj[ta])
 
-        # PCS limits
-        prob += sc_t + xc_t + y_c[k] <= p_max,              f"PCS_c_{k}"
+        # PCS charge limit (x_c and y_c only — s_c is separate DC path)
+        prob += xc_t + y_c[k]         <= p_max,              f"PCS_c_{k}"
         prob += cd_t + xd_t + y_d[k] <= p_max,              f"PCS_d_{k}"
         # C_RTC at RT level
         prob += sc_t + cd_t == cap_rt_lp[k],                 f"CRTC_{k}"
         # C_PSHORT (fixed 4 MW)
         prob += psh[k] >= PSHORT - (sc_t + cd_t),            f"PSH_{k}"
-        # C3 (DC-coupled: s_c through PCS, delta applies)
-        prob += xc_t + y_c[k] + sc_t <= p_max * dl[k],      f"C3a_{k}"
+        # C3 (s_c via separate DC-DC path — NOT mutex with export)
+        prob += xc_t + y_c[k]        <= p_max * dl[k],       f"C3a_{k}"
         prob += xd_t + y_d[k] + cd_t <= p_max*(1-dl[k]),    f"C3b_{k}"
         # C4: SoC dynamics
         prob += soc_lp[k+1] == (
@@ -856,4 +857,3 @@ def evaluate_actuals_rtc(params,
         "x_c":  x_c_s1,  "x_d":  x_d_s1,
         "y_c":  y_c_committed, "y_d": y_d_committed,
         "s_c_rt": s_c_rt, "s_cd_rt": s_cd_rt, "c_d_rt": c_d_rt,
-    }
