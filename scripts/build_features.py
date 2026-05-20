@@ -1,86 +1,53 @@
 """
 scripts/build_features.py — Architecture v10_revised (15-Minute Block Feature Builder)
 ======================================================================================
-Transforms raw multi-market feed arrays into standardized 96-block layout matrices.
-Aligns time shifts using 4-block (1-hour wall clock) and 96-block (24-hour day scale) index steps.
+Orchestrates the feature engineering pipeline for DAM and RTM markets.
+All 15-minute resolution logic (BPH=4, 96 blocks/day) is handled by the
+modules in src/features/:
+  - price_features.py   (lag shifts ×4, rolling windows ×4)
+  - bid_stack_features.py (groupby delivery_start_ist, lag shift(4))
+  - grid_features.py    (hourly→96-block expansion in loader, shift(4))
+  - weather_features.py (auto-detect BPH, shift accordingly)
+  - calendar_features.py (timestamp-based, resolution-agnostic)
+  - pipeline.py         (orchestrator: complete-day=96, target_block 1-96,
+                          SNAPSHOT_BLOCK=33, mcp_same_block_yesterday)
+
+This script is a thin entry point. All feature engineering logic lives
+in src/features/pipeline.py::build_all_features().
 """
 
 import argparse
 import sys
-import os
-import time
-import yaml
-import pandas as pd
-import numpy as np
 from pathlib import Path
 
-# Insert parent repository path into system workspace environment
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+# Add project root to path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-def verify_and_build_block_lags(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Enforces true 15-minute operational block offset calculations.
-    Replaces 1-hour wall-clock step lookbacks with a 4-block index shift window.
-    """
-    out_df = df.copy()
-    
-    # Core price field definitions
-    if 'rtm_price' in out_df.columns:
-        out_df['rtm_price_lag_4'] = out_df['rtm_price'].shift(4)     # 1-hour wall-clock lag
-        out_df['rtm_price_lag_96'] = out_df['rtm_price'].shift(96)   # 24-hour day-to-day offset
-        out_df['rtm_price_roll_mean_4'] = out_df['rtm_price'].shift(1).rolling(window=4).mean()
-    else:
-        raise KeyError("Input dataframe lacks the required base column: 'rtm_price'")
-        
-    # Weather profile feature field mappings
-    if 'solar_irradiance' in out_df.columns:
-        out_df['solar_irradiance_lag_96'] = out_df['solar_irradiance'].shift(96)
-        out_df['solar_irradiance_roll_max_4'] = out_df['solar_irradiance'].shift(1).rolling(window=4).max()
-        
-    return out_df.dropna()
+from src.features.pipeline import build_all_features
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-market 15-minute resolution feature engineering engine.")
-    parser.add_argument('--config', default='config/backtest_config.yaml', help='Path to setup profile.')
-    parser.add_argument('--input', default='data/raw_market_feed.csv', help='Raw data pathway.')
-    parser.add_argument('--output', default='data/processed_features.csv', help='Destination matrix path.')
+    parser = argparse.ArgumentParser(
+        description="Build 96-block feature matrices for DAM and RTM markets.")
+    parser.add_argument(
+        "--config", default="config/backtest_config.yaml",
+        help="Path to backtest configuration YAML.")
     args = parser.parse_args()
-    
-    if not os.path.exists(args.config):
-        print(f"Error: Target layout configuration configuration file not found at: {args.config}")
-        sys.exit(1)
-        
-    start_time = time.time()
-    print(f"Initiating feature engineering execution pipeline map using layout profiles from: {args.config}")
-    
-    # Mock fallback runner or database interface wrapper
-    if not os.path.exists(args.input):
-        print(f"Target raw data path not found at '{args.input}'. Building high-fidelity test framework matrix dataframe...")
-        # Create a sample synthetic dataframe matching 96 blocks per day for a 10-day testing window
-        date_range = pd.date_range(start="2026-01-01", periods=960, freq="15min")
-        synthetic_data = pd.DataFrame({
-            "timestamp": date_range,
-            "rtm_price": np.random.uniform(2000, 6000, size=960),
-            "solar_irradiance": np.sin(np.linspace(0, np.pi * 20, 960)) * 800 + np.random.normal(0, 30, 960)
-        })
-        synthetic_data.loc[synthetic_data['solar_irradiance'] < 0, 'solar_irradiance'] = 0.0
-        os.makedirs(os.path.dirname(args.input) or '.', exist_ok=True)
-        synthetic_data.to_csv(args.input, index=False)
 
-    # Execute processing calculations across field groups
-    try:
-        raw_df = pd.read_csv(args.input, parse_dates=['timestamp'])
-        processed_df = verify_and_build_block_lags(raw_df)
-        
-        os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
-        processed_df.to_csv(args.output, index=False)
-        
-        print(f"Success: Processed matrix built successfully at: {args.output}")
-        print(f"Processed shape dimension layout sizes: {processed_df.shape}")
-        print(f"Pipeline processing execution finalized in {time.time() - start_time:.2f} seconds.")
-    except Exception as err:
-        print(f"Fatal operational exception encountered during execution: {str(err)}")
+    config_path = Path(args.config)
+    if not config_path.exists():
+        print(f"Error: Config file not found: {config_path}")
         sys.exit(1)
 
-if __name__ == '__main__':
+    print("=" * 60)
+    print("FEATURE ENGINEERING — Architecture v10_revised (96 blocks)")
+    print("=" * 60)
+    print(f"Config: {config_path}")
+
+    build_all_features(str(config_path))
+
+    print("\nFeature engineering complete.")
+
+
+if __name__ == "__main__":
     main()
