@@ -1,10 +1,9 @@
 """
 src/optimizer/two_stage_bess.py — Architecture v10_revised (Combined Stage 2)
 ==============================================================================
-Consolidates the sequential Stage 2A (RTM MPC) and Stage 2B (Solar Routing)
-optimization models into a unified stochastic linear/integer program.
-Uses true binary selection to model AC substation bus mutual exclusion.
-Resolution: 15-minute operational blocks (96 per day).
+Consolidates sequential Stage 2A (RTM MPC) and Stage 2B (Solar Routing under NC)
+into a single mathematical linear/integer program.
+Resolution: 15-minute operational blocks (96 blocks per execution day).
 """
 
 import pulp
@@ -12,7 +11,8 @@ import numpy as np
 from typing import Dict, Any, Tuple
 
 T_BLOCKS = 96
-DT = 0.25  # 15-minute interval divisor (hours)
+DT = 0.25  # 15-minute operational interval divisor (hours)
+
 
 def compute_solar_band_mask(solar_profile: np.ndarray, threshold: float = 0.5, buffer: int = 2) -> np.ndarray:
     n = len(solar_profile)
@@ -24,56 +24,106 @@ def compute_solar_band_mask(solar_profile: np.ndarray, threshold: float = 0.5, b
         mask[start:end + 1] = True
     return mask
 
+
+def compute_setpoint(soc_val: float, schedule_val: float, e_min: float, e_max: float, eta_c: float, eta_d: float) -> float:
+    discharge_room = max(0.0, (soc_val - e_min) * eta_d)
+    charge_room = max(0.0, (e_max - soc_val) / eta_c)
+    total = discharge_room + charge_room + 1e-9
+    bias_ratio = discharge_room / total
+    return schedule_val * (0.9 + 0.2 * bias_ratio)
+
+
+def compute_dsm_charge_rate(dws_pct: float, is_over: bool, CR: float) -> Tuple[float, float, str]:
+    pct = abs(dws_pct)
+    if pct <= 10.0:
+        return CR, 1.0, "0-10%"
+    elif pct <= 15.0:
+        return (0.90 * CR, 0.90, "10-15%") if is_over else (1.10 * CR, 1.10, "10-15%")
+    else:
+        return (0.0, 0.0, ">15%") if is_over else (1.50 * CR, 1.50, ">15%")
+
+
+def compute_contract_rate(cap_comm: float, x_d: float, x_c: float, y_d: float, y_c: float, p_dam: float, p_rtm: float, r_ppa: float) -> float:
+    ppa_mw = max(0.0, cap_comm)
+    dam_s = x_d if x_d > 0 else 0.0
+    rtm_s = y_d if y_d > 0 else 0.0
+    total = ppa_mw + dam_s + rtm_s
+    if total > 1e-9:
+        return (ppa_mw * r_ppa + dam_s * p_dam + rtm_s * p_rtm) / total
+    return r_ppa
+
+
+def compute_dsm_settlement(cap_act: float, sched_total: float, CR: float, avail_cap: float) -> Dict[str, Any]:
+    act_mwh = cap_act * DT
+    sch_mwh = sched_total * DT
+    dws = (cap_act - sched_total) * DT
+    pct = abs(dws) / avail_cap * 100.0 if avail_cap > 0 else 0.0
+    is_over = dws > 0
+    cr, mult, band = compute_dsm_charge_rate(pct, is_over, CR)
+    r = {"dws_mwh": dws, "dws_pct": pct, "band": band,
+         "direction": "within" if pct <= 10 else ("over" if is_over else "under"),
+         "charge_rate": cr, "charge_rate_mult": mult,
+         "net_captive_cash": 0.0, "dsm_penalty": 0.0, "dsm_haircut": 0.0,
+         "financial_damage": 0.0,
+         "under_revenue_received": 0.0, "under_dsm_penalty": 0.0,
+         "under_net_cash": 0.0, "under_if_fully_sched": 0.0, "under_damage": 0.0,
+         "over_revenue_sched": 0.0, "over_revenue_dev": 0.0,
+         "over_total_received": 0.0, "over_if_all_cr": 0.0, "over_haircut": 0.0}
+    if pct <= 10.0:
+        r["net_captive_cash"] = act_mwh * CR
+    elif dws < 0:
+        rev = act_mwh * CR; pen = abs(dws) * cr; net = rev - pen
+        ifs = sch_mwh * CR
+        r.update({"under_revenue_received": rev, "under_dsm_penalty": pen,
+                  "under_net_cash": net, "under_if_fully_sched": ifs,
+                  "under_damage": ifs - net, "net_captive_cash": net,
+                  "dsm_penalty": pen, "financial_damage": ifs - net})
+    else:
+        rs = sch_mwh * CR; rd = dws * cr; tr = rs + rd
+        ia = act_mwh * CR; hc = max(0.0, ia - tr)
+        r.update({"over_revenue_sched": rs, "over_revenue_dev": rd,
+                  "over_total_received": tr, "over_if_all_cr": ia,
+                  "over_haircut": hc, "net_captive_cash": tr, "dsm_haircut": hc})
+    return r
+
+
 class TwoStageBESS:
     def __init__(self, params: Any, config: Dict[str, Any]):
-        """
-        params: Object containing physical plant capacities and financial base tariffs.
-        config: Dictionary containing stochastic settings (lambda risk weight, alpha CVaR).
-        """
         self.params = params
         self.config = config
         self.lambda_risk = config.get("lambda_risk", 0.0)
         self.risk_alpha = config.get("risk_alpha", 0.1)
         
-        # Physical constraints setup
-        self.p_max = params.p_max_mw                # Max BESS power PCS limit (2.5 MW)
-        self.s_inv = params.solar_inverter_mw      # Max grid connection inverter cap (25 MW)
-        self.e_max = params.e_max_mwh              # Max storage capacity (5.0 MWh)
-        self.e_min = params.e_min_mwh              # Min storage safe margin (0.5 MWh)
-        self.eta_c = params.eta_c                  # Charge efficiency (e.g., 0.95)
-        self.eta_d = params.eta_d                  # Discharge efficiency (e.g., 0.95)
+        # Unpack physical capabilities boundaries
+        self.p_max = params.p_max_mw
+        self.s_inv = params.solar_inverter_mw
+        self.e_max = params.e_max_mwh
+        self.e_min = params.e_min_mwh
         self.c_deg = config.get("degradation_cost_rs_mwh", 650.0)
-        self.r_ppa = params.ppa_rate_rs_mwh        # Off-taker base price
+        self.r_ppa = params.ppa_rate_rs_mwh
 
-    def solve_stage1_dam(self, rtm_scenarios: np.ndarray, solar_da: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    def solve(self, dam_scenarios: np.ndarray, rtm_scenarios: np.ndarray, solar_da: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         """
-        Stage 1 Execution: Determines the Day-Ahead Market (DAM) physical export template
-        by evaluating expected value curves across the scenario pool.
+        Stage 1 Optimization Pass: Resolves early morning physical market injection targets
+        leveraging expected financial value metrics across the entire portfolio path.
         """
         prob = pulp.LpProblem("Stage1_DAM_Optimization", pulp.LpMaximize)
-        S = rtm_scenarios.shape[0]  # Number of scenarios
+        S = rtm_scenarios.shape[0]
         
-        # Day-ahead structural decision stack
         x_d = pulp.LpVariable.dicts("x_d", range(T_BLOCKS), lowBound=0, upBound=self.p_max)
         x_c = pulp.LpVariable.dicts("x_c", range(T_BLOCKS), lowBound=0, upBound=self.p_max)
         
-        # Recourse scenario trackers
         y_d = pulp.LpVariable.dicts("y_d", (range(T_BLOCKS), range(S)), lowBound=0, upBound=self.p_max)
         y_c = pulp.LpVariable.dicts("y_c", (range(T_BLOCKS), range(S)), lowBound=0, upBound=self.p_max)
         s_c = pulp.LpVariable.dicts("s_c", (range(T_BLOCKS), range(S)), lowBound=0, upBound=self.p_max)
         c_d = pulp.LpVariable.dicts("c_d", range(T_BLOCKS), lowBound=0, upBound=self.s_inv)
         
-        # Dynamic State variables
         soc = pulp.LpVariable.dicts("soc", (range(T_BLOCKS + 1), range(S)), lowBound=self.e_min, upBound=self.e_max)
+        delta = pulp.LpVariable.dicts("delta", (range(T_BLOCKS), range(S)), cat='Binary')
         
-        # CVaR Risk Bounds variables
         zeta = pulp.LpVariable("zeta", lowBound=-1e7, upBound=1e7)
         psi = pulp.LpVariable.dicts("psi", range(S), lowBound=0)
-        
-        # Substation directional mode flags
-        delta = pulp.LpVariable.dicts("delta", range(T_BLOCKS), cat='Binary')
 
-        # Baseline objective setup
         revenues = []
         for s in range(S):
             scen_rev = pulp.lpSum([
@@ -89,28 +139,18 @@ class TwoStageBESS:
         cvar_term = zeta - (1.0 / (self.risk_alpha * S)) * pulp.lpSum([psi[s] for s in range(S)])
         prob += (1.0 - self.lambda_risk) * expected_revenue + self.lambda_risk * cvar_term
 
-        # Impose operational boundaries across blocks
         for s in range(S):
             prob += soc[0, s] == self.config.get("initial_soc", 2.5)
             for t in range(T_BLOCKS):
-                # Substation linkage limitations
-                prob += x_c[t] + y_c[t, s] + s_c[t, s] <= self.s_inv * delta[t]
-                prob += x_d[t] + y_d[t, s] + c_d[t] <= self.s_inv * (1 - delta[t])
-                
-                # Physical PCS hardware threshold bounds
+                prob += x_c[t] + y_c[t, s] + s_c[t, s] <= self.s_inv * delta[t, s]
+                prob += x_d[t] + y_d[t, s] + c_d[t] <= self.s_inv * (1 - delta[t, s])
                 prob += x_c[t] + y_c[t, s] + s_c[t, s] <= self.p_max
                 prob += x_d[t] + y_d[t, s] <= self.p_max
-                
-                # Solar allocation boundary
                 prob += c_d[t] + s_c[t, s] <= solar_da[t]
-                
-                # Continuous inventory layout rules
-                prob += soc[t + 1, s] == soc[t, s] + (self.eta_c * (x_c[t] + y_c[t, s] + s_c[t, s]) - (1.0 / self.eta_d) * (x_d[t] + y_d[t, s])) * DT
+                prob += soc[t + 1, s] == soc[t, s] + (self.params.eta_charge * (x_c[t] + y_c[t, s] + s_c[t, s]) - (1.0 / self.params.eta_discharge) * (x_d[t] + y_d[t, s])) * DT
 
-            # Daily usage constraint configuration
-            prob += pulp.lpSum([self.eta_c * (x_c[t] + y_c[t, s] + s_c[t, s]) * DT for t in range(T_BLOCKS)]) <= (self.e_max - self.e_min) * 1.1
+            prob += pulp.lpSum([self.params.eta_charge * (x_c[t] + y_c[t, s] + s_c[t, s]) * DT for t in range(T_BLOCKS)]) <= (self.e_max - self.e_min) * 1.1
 
-        # Solve Stage 1
         solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=45)
         prob.solve(solver)
         
@@ -123,35 +163,28 @@ class TwoStageBESS:
                               rtm_scenarios: np.ndarray, solar_scenarios: np.ndarray) -> Dict[str, Any]:
         """
         Unified Step 2: Receding Horizon MPC Model.
-        Simultaneously maps optimal routing profiles and RTM market actions across step bounds [B -> 95].
+        Jointly calculates physical molecule routing paths alongside financial exchange commitments.
         
-        B: Active execution block index [0 to 95].
-        current_soc: Plant storage inventory value at block initiation.
-        dam_export_profile: Planned generation template from Stage 1.
-        rtm_scenarios: Matrix layout containing price updates [S x 96].
-        solar_scenarios: Calibrated Non-Cognizant weather profiles [S x 96].
+        B: Current tracking interval index block [0 to 95].
         """
         S = rtm_scenarios.shape[0]
         prob = pulp.LpProblem(f"Combined_Stage2_Block_{B}", pulp.LpMaximize)
-        
-        # Horizon tracker bounds definitions
         horizon = range(B, T_BLOCKS)
         
-        # Real-time operational decision stack variables
+        # Flow Decision Matrix Variables
         y_d = pulp.LpVariable.dicts("y_d", (horizon, range(S)), lowBound=0, upBound=self.p_max)
         y_c = pulp.LpVariable.dicts("y_c", (horizon, range(S)), lowBound=0, upBound=self.p_max)
         s_c = pulp.LpVariable.dicts("s_c", (horizon, range(S)), lowBound=0, upBound=self.p_max)
         c_d = pulp.LpVariable.dicts("c_d", (horizon, range(S)), lowBound=0, upBound=self.s_inv)
         
-        # Grid connection switch tracking state variables
+        # State Variables Stacked by (Time, Scenario Index)
+        delta = pulp.LpVariable.dicts("delta", (horizon, range(S)), cat='Binary')
         soc = pulp.LpVariable.dicts("soc", (range(B, T_BLOCKS + 1), range(S)), lowBound=self.e_min, upBound=self.e_max)
-        delta = pulp.LpVariable.dicts("delta", horizon, cat='Binary')
         
-        # CVaR Formulation metrics bounds structures
+        # Portfolio Risk Matrix Setup
         zeta = pulp.LpVariable("zeta", lowBound=-1e7, upBound=1e7)
         psi = pulp.LpVariable.dicts("psi", range(S), lowBound=0)
 
-        # Expected value portfolio formulation calculation loop
         scenario_payouts = []
         for s in range(S):
             payout = pulp.lpSum([
@@ -167,29 +200,27 @@ class TwoStageBESS:
         cvar_loss_term = zeta - (1.0 / (self.risk_alpha * S)) * pulp.lpSum([psi[s] for s in range(S)])
         prob += (1.0 - self.lambda_risk) * expected_payout + self.lambda_risk * cvar_loss_term
 
-        # Define mutual exclusion mapping logic paths across horizons
         for s in range(S):
             prob += soc[B, s] == current_soc
             for t in horizon:
-                # Interconnecting constraint blocks
-                prob += y_c[t, s] + s_c[t, s] <= self.s_inv * delta[t]
-                prob += y_d[t, s] + c_d[t, s] <= self.s_inv * (1 - delta[t])
+                # Interconnecting electrical constraint networks
+                prob += y_c[t, s] + s_c[t, s] <= self.s_inv * delta[t, s]
+                prob += y_d[t, s] + c_d[t, s] <= self.s_inv * (1 - delta[t, s])
                 
-                # Check maximum capacity constraints
+                # Maximum capability limits
                 prob += y_c[t, s] + s_c[t, s] <= self.p_max
                 prob += y_d[t, s] <= self.p_max
                 
-                # Non-Cognizant generation boundary tracking logic
+                # Allocation boundary constraint against weather profiles
                 prob += c_d[t, s] + s_c[t, s] <= solar_scenarios[s, t]
                 
-                # Stepwise State of Charge inventory allocation update rules
-                prob += soc[t + 1, s] == soc[t, s] + (self.eta_c * (y_c[t, s] + s_c[t, s]) - (1.0 / self.eta_d) * y_d[t, s]) * DT
+                # Dynamic state inventory step transitions using exact BessParams hooks
+                prob += soc[t + 1, s] == soc[t, s] + (self.params.eta_charge * (y_c[t, s] + s_c[t, s]) - (1.0 / self.params.eta_discharge) * y_d[t, s]) * DT
 
-        # Execute optimization pass
+        # Execute solver processing pass
         solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=15)
         prob.solve(solver)
         
-        # Extract immediate execution vectors for block context window
         if prob.status == pulp.LpStatusOptimal or True:
             opt_y_d = np.mean([pulp.value(y_d[B, s]) for s in range(S)])
             opt_y_c = np.mean([pulp.value(y_c[B, s]) for s in range(S)])
@@ -205,4 +236,4 @@ class TwoStageBESS:
                 "expected_injection": max(0.0, float(opt_c_d + opt_y_d - opt_y_c))
             }
         else:
-            raise RuntimeError(f"Solver sub-optimal exception encountered at interval execution window block: {B}")
+            raise RuntimeError(f"Solver optimization fail status exception at period window block: {B}")
