@@ -1,37 +1,48 @@
-# config/bess_rtc.yaml — Architecture v10 RTC FINAL
-# Solar (25.4 MWp DC / 16.4 MW AC) + BESS (80 MWh / 16.4 MW PCS)
+# config/bess_rtc.yaml — Architecture v10 RTC FINAL (Reverse DC System)
+# Solar + BESS Reverse DC System
+# Solar SCBs + BESS in parallel on shared DC Bus → single PCS → AC Bus → Grid
+# 25.4 MWp DC / dc_con 16.4 MW / 80 MWh BESS / p_max 16.4 MW
 # 5 MW RTC Captive | PPA Rs 5,000/MWh
 
-p_max_mw: 16.4
+# ── BESS Physical ──────────────────────────────────────────────────────────────
+p_max_mw: 16.4              # PCS rating — total AC output limit (single PCS)
 e_max_mwh: 80.0
 e_min_mwh: 8.0
-soc_initial_mwh: 40.0
-soc_terminal_min_mwh: 40.0
+soc_initial_mwh: 40.0       # SOD = 40 MWh (hard equality C5)
+soc_terminal_min_mwh: 40.0  # EOD = 40 MWh (hard equality C5)
 eta_charge: 0.9487
 eta_discharge: 0.9487
 
+# ── Solar Plant (Reverse DC) ───────────────────────────────────────────────────
 solar_capacity_mwp: 25.4
-solar_inverter_mw: 16.4
+dc_con_mw: 16.4              # DC-DC converter capacity (replaces solar_inverter_mw)
+                              # Limits solar contribution to DC Bus and C3c bound
 
+# ── Financial ─────────────────────────────────────────────────────────────────
 ppa_rate_rs_mwh: 5000.0
 iex_fee_rs_mwh: 200.0
-degradation_cost_rs_mwh: 650.0
+degradation_cost_rs_mwh: 650.0   # POST-HOC only — NOT in LP
 
-rtc_mw: 5.0
-rtc_min_mw: 1.0
-rtc_floor_pct: 0.80
-rtc_tol_pct: 0.05
-rtc_advance_blocks: 16
+# ── RTC Captive Contract ───────────────────────────────────────────────────────
+rtc_mw: 5.0                  # Contract ceiling — LP upper bound
+rtc_min_mw: 1.0              # LP lower bound (low-SoC days)
+rtc_floor_pct: 0.80          # THRESHOLD = rtc_floor_pct × rtc_mw = 4.0 MW
+rtc_tol_pct: 0.05            # ±5% inner RTC free band (notice boundary)
+dsm_tol_pct: 0.10            # ±10% outer DSM free band (penalty-free per CERC)
+rtc_advance_blocks: 16       # 4-hour advance notice for >5% revision
 
-max_cycles_per_day: 1
-soc_terminal_mode: hard
-soc_terminal_value_rs_mwh: 0.0
+# ── Optimizer ─────────────────────────────────────────────────────────────────
+max_cycles_per_day: 1        # C7: USABLE = 72 MWh = 1 cycle
+soc_terminal_mode: hard      # soc[s][96] == 40 MWh equality
+soc_terminal_value_rs_mwh: 0.0  # removed — hard C5 replaces reward
 
+# ── Stage 2 Timing ─────────────────────────────────────────────────────────────
 rtm_lead_blocks: 3
 captive_buffer_blocks: 12
 captive_buffer_tolerance_mw: 0.5
 
-soc_solar_low_pct: 0.15
-soc_solar_high_pct: 0.85
+# ── Solar SoC Band ─────────────────────────────────────────────────────────────
+soc_solar_low_pct: 0.15      # 15% × 80 = 12.0 MWh
+soc_solar_high_pct: 0.85     # 85% × 80 = 68.0 MWh
 solar_threshold_mw: 0.5
 solar_buffer_blocks: 2
