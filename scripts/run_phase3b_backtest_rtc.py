@@ -145,7 +145,11 @@ def _build_block_df(ev:         dict,
     x_d_arr  = np.array(res1["x_d"],          dtype=float)
     scd_da   = np.array(res1["s_cd_da"],       dtype=float)
     cd_da    = np.array(res1["c_d_da"],        dtype=float)
-    c_rtc_da = np.array(res1["C_RTC_da"],      dtype=float)   # NEW
+    # C_RTC_da: Stage 1 captive delivery = RTC_committed every block
+    # Use captive_da as fallback if C_RTC_da not in res1
+    _c_rtc_da_raw = res1.get("C_RTC_da", res1.get("captive_da",
+                    [rtc_committed]*T_BLOCKS))
+    c_rtc_da = np.array(_c_rtc_da_raw, dtype=float)
     cap_da   = c_rtc_da                                        # alias
     sch_da   = np.array(res1["schedule_da"],   dtype=float)
     spt_da   = np.array(res1["setpoint_da"],   dtype=float)
@@ -496,10 +500,15 @@ def run_backtest(args):
             "bess_total_value":  ev["bess_total_value"],
             # Arrays
             "soc_path":          [round(s, 3) for s in ev["soc_path"].tolist()],
-            "C_RTC_da":          [round(v, 3) for v in res1["C_RTC_da"]],
-            "C_RTC_rt":          [round(v, 3) for v in ev["C_RTC_rt"].tolist()],
+            "C_RTC_da":          [round(v, 3) for v in res1.get("C_RTC_da",
+                                  res1.get("captive_da", [rtc_val]*T_BLOCKS))],
+            "C_RTC_rt":          [round(v, 3) for v in
+                                  (ev["C_RTC_rt"].tolist() if "C_RTC_rt" in ev
+                                   else ev.get("captive_committed", [rtc_val]*T_BLOCKS))],
             "captive_actual":    [round(v, 3) for v in ev["captive_actual"].tolist()],
-            "rtc_notice_block":  ev["rtc_notice_block"].tolist(),
+            "rtc_notice_block":  (ev["rtc_notice_block"].tolist()
+                                  if "rtc_notice_block" in ev
+                                  else [-1]*T_BLOCKS),
             "rtc_penalty_by_block": [round(v,2) for v in ev["block_captive_penalty"].tolist()],
         }
         with open(daily_dir / f"phase3b_rtc_{date}.json", "w") as jf:
@@ -544,12 +553,3 @@ def run_backtest(args):
         except PermissionError:
             # File is open in Excel — write to a timestamped fallback
             import datetime
-            ts = datetime.datetime.now().strftime("%H%M%S")
-            fallback = results_dir / f"phase3b_rtc_all_blocks_{ts}.csv"
-            all_df.to_csv(fallback, index=False)
-            print(f"PermissionError on {all_csv.name} (close it in Excel)")
-            print(f"Saved to fallback: {fallback}")
-
-
-if __name__ == "__main__":
-    run_backtest(parse_args())
