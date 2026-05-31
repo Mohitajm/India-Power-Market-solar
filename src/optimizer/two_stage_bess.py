@@ -316,6 +316,7 @@ class TwoStageBESSRTC:
             "RTC_committed":    rtc_val,
             "x_c": xc_v, "x_d": xd_v,
             "s_c_da": sc_v, "s_cd_da": scd_v, "c_d_da": cd_v,
+            "C_RTC_da":   cap_da,
             "captive_da": cap_da, "dam_net": dam_net,
             "schedule_da": sched_da, "setpoint_da": sp_da,
             "solar_band_mask": solar_mask.tolist(),
