@@ -538,8 +538,17 @@ def run_backtest(args):
     if all_dfs:
         all_df  = pd.concat(all_dfs, ignore_index=True)
         all_csv = results_dir / "phase3b_rtc_all_blocks.csv"
-        all_df.to_csv(all_csv, index=False)
-        print(f"All blocks:{all_csv}  ({len(all_df)} rows, {len(all_df.columns)} cols)")
+        try:
+            all_df.to_csv(all_csv, index=False)
+            print(f"All blocks:{all_csv}  ({len(all_df)} rows, {len(all_df.columns)} cols)")
+        except PermissionError:
+            # File is open in Excel — write to a timestamped fallback
+            import datetime
+            ts = datetime.datetime.now().strftime("%H%M%S")
+            fallback = results_dir / f"phase3b_rtc_all_blocks_{ts}.csv"
+            all_df.to_csv(fallback, index=False)
+            print(f"PermissionError on {all_csv.name} (close it in Excel)")
+            print(f"Saved to fallback: {fallback}")
 
 
 if __name__ == "__main__":
