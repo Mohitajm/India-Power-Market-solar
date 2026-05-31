@@ -1,87 +1,127 @@
 """
-src/optimizer/two_stage_bess.py — Architecture v10_revised (Combined Stage 2)
-==============================================================================
-Stage 1:  D-1 MILP. Commits x_c, x_d, solar routing. No y_c/y_d.
-Combined Stage 2: Receding-horizon MPC at every block B.
-  Jointly optimizes solar routing (s_c_rt, s_cd_rt, c_d_rt) AND
-  RTM bids (y_c, y_d) in a single LP. At NC trigger blocks {34,42,50,58},
-  solar forecast is updated with 12-block NC nowcast.
-  Only y_c[B+3], y_d[B+3] committed per solve.
-Resolution: 15-minute blocks (96 per day).
+src/optimizer/two_stage_bess_rtc.py — Architecture v10 RTC FINAL
+=================================================================
+Three-stage Solar+BESS optimizer with Round-the-Clock (RTC) captive contract.
+
+HARDWARE : 25.4 MWp DC / 16.4 MW PCS / 80 MWh BESS
+CONTRACT : 5 MW RTC ceiling | PPA Rs 5,000/MWh | fixed 4 MW penalty threshold
+TOPOLOGY : DC-coupled — Solar SCB → DC-DC → DC Bus ← BESS → PCS → AC Bus → Grid
+
+CHANGE LOG (from earlier versions)
+───────────────────────────────────
+FIX-1  Topology C3 REVISED: s_c[t] is NOT restricted by delta.
+       Solar→BESS via DC-DC converter is SEPARATE from PCS AC bus.
+       Correct code:   x_c[t]+s_c[t] <= p_max×delta[t]
+
+FIX-2  Setpoint formula: bias heuristic clamped to ±RTC_TOL_PCT (±5%).
+       setpoint = schedule × (0.90 + 0.20×bias), clamp to [0.95, 1.05] × schedule
+       This ensures EMS never dispatches outside the consumer's free band.
+
+FIX-3  C7 cycle constraint added to Stage 1 (was missing; present in Stage 2B/2A).
+       prob += Σ (x_d[t]+c_d[t])×DT/η_d ≤ USABLE = 72 MWh  (per scenario)
+
+FIX-4  C_PSHORT uses fixed 4.0 MW threshold (= 0.80×rtc_mw ceiling),
+       NOT dynamic 0.80×RTC_committed. PPA contract floor is vs ceiling, not day level.
+
+FIX-5  SOD=EOD=40 MWh hard equality (C5). soc_terminal_value removed.
+
+FIX-6  rtc_min_mw = 1.0 MW (allows LP to commit 1 MW on very-low-SoC days).
+
+FIX-7  SoC solar band: 15%–85% of e_max = [12, 68] MWh (was 20%–80%).
+
+FIX-8  ppa_rate_rs_mwh = 5000 (Rs 5/unit per contract).
+
+FIX-9  bess_params_rtc.py: rtc_pshort_threshold_mw property is fixed (not dynamic).
 """
 
 import pulp
 import numpy as np
-from typing import Dict, Any, Tuple, List
+from typing import Dict, List, Optional, Tuple
 
-T_BLOCKS = 96
-DT = 0.25
-NC_TRIGGER_BLOCKS = [34, 42, 50, 58]
+T_BLOCKS          = 96
+DT                = 0.25
+RESCHEDULE_BLOCKS = [34, 42, 50, 58]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_solar_band_mask(solar_profile: np.ndarray,
-                            threshold: float = 0.5, buffer: int = 2) -> np.ndarray:
-    n = len(solar_profile)
-    mask = np.zeros(n, dtype=bool)
-    solar_blocks = [t for t in range(n) if solar_profile[t] > threshold]
+def compute_solar_band_mask_rtc(solar: np.ndarray,
+                                threshold: float = 0.5,
+                                buffer: int = 2) -> np.ndarray:
+    """Boolean mask True during solar-generation hours (±buffer blocks)."""
+    mask         = np.zeros(len(solar), dtype=bool)
+    solar_blocks = [t for t in range(len(solar)) if solar[t] > threshold]
     if solar_blocks:
-        start = max(0, min(solar_blocks) - buffer)
-        end = min(n - 1, max(solar_blocks) + buffer)
-        mask[start:end + 1] = True
+        s = max(0,            min(solar_blocks) - buffer)
+        e = min(len(solar)-1, max(solar_blocks) + buffer)
+        mask[s:e+1] = True
     return mask
 
 
-def compute_setpoint(soc_val: float, schedule_val: float,
-                     e_min: float, e_max: float,
-                     eta_c: float, eta_d: float) -> float:
-    discharge_room = max(0.0, (soc_val - e_min) * eta_d)
-    charge_room = max(0.0, (e_max - soc_val) / eta_c)
-    total = discharge_room + charge_room + 1e-9
-    bias_ratio = discharge_room / total
-    return schedule_val * (0.9 + 0.2 * bias_ratio)
+def compute_setpoint_rtc(soc: float, schedule: float,
+                          e_min: float, e_max: float,
+                          eta_c: float, eta_d: float,
+                          rtc_tol_pct: float = 0.05) -> float:
+    """
+    Setpoint = schedule × (0.90 + 0.20 × bias_ratio), clamped to ±rtc_tol_pct.
+
+    The SoC bias heuristic shapes where inside the ±5% free band the EMS targets:
+      SoC = e_min (8):   raw = 0.90 × schedule → clamped UP   to 0.95 × schedule
+      SoC = 40 MWh (mid):raw ≈ 1.00 × schedule → within band
+      SoC = e_max (80):  raw = 1.10 × schedule → clamped DOWN to 1.05 × schedule
+
+    The ±5% clamp implements RTC_TOL_PCT — the EMS NEVER dispatches outside the
+    consumer's free band without triggering the advance-notice protocol.
+
+    Parameters
+    ----------
+    soc          : current SoC (MWh)
+    schedule     : schedule_da[t] or schedule_rt[t] (MW) filed with SLDC
+    rtc_tol_pct  : free band (default 0.05 = ±5%)
+    """
+    dr  = max(0.0, (soc - e_min) * eta_d)
+    cr  = max(0.0, (e_max - soc) / eta_c)
+    br  = dr / (dr + cr + 1e-9)
+    raw = schedule * (0.90 + 0.20 * br)
+    lo  = schedule * (1.0 - rtc_tol_pct)
+    hi  = schedule * (1.0 + rtc_tol_pct)
+    return float(np.clip(raw, lo, hi))
 
 
-def compute_dsm_charge_rate(dws_pct: float, is_over: bool,
-                            CR: float) -> Tuple[float, float, str]:
-    pct = abs(dws_pct)
-    if pct <= 10.0:
-        return CR, 1.0, "0-10%"
-    elif pct <= 15.0:
-        return (0.90 * CR, 0.90, "10-15%") if is_over \
-            else (1.10 * CR, 1.10, "10-15%")
-    else:
-        return (0.0, 0.0, ">15%") if is_over \
-            else (1.50 * CR, 1.50, ">15%")
-
-
-def compute_contract_rate(cap_comm: float, x_d: float, x_c: float,
-                          y_d: float, y_c: float,
+def compute_contract_rate(rtc_committed: float, x_d: float, y_d: float,
                           p_dam: float, p_rtm: float, r_ppa: float) -> float:
-    ppa_mw = max(0.0, cap_comm)
-    dam_s = x_d if x_d > 0 else 0.0
-    rtm_s = y_d if y_d > 0 else 0.0
-    total = ppa_mw + dam_s + rtm_s
-    if total > 1e-9:
-        return (ppa_mw * r_ppa + dam_s * p_dam + rtm_s * p_rtm) / total
-    return r_ppa
+    """Blended CR = (captive×PPA + DAM×p_dam + RTM×p_rtm) / total_sell."""
+    ppa = max(0.0, rtc_committed)
+    dam = max(0.0, x_d)
+    rtm = max(0.0, y_d)
+    tot = ppa + dam + rtm
+    return (ppa*r_ppa + dam*p_dam + rtm*p_rtm) / tot if tot > 1e-9 else r_ppa
 
 
-def compute_dsm_settlement(cap_act: float, sched_total: float,
-                           CR: float, avail_cap: float) -> Dict[str, Any]:
-    act_mwh = cap_act * DT
-    sch_mwh = sched_total * DT
-    dws = (cap_act - sched_total) * DT
-    pct = abs(dws) / avail_cap * 100.0 if avail_cap > 0 else 0.0
-    is_over = dws > 0
-    cr, mult, band = compute_dsm_charge_rate(pct, is_over, CR)
-    r: Dict[str, Any] = {
+def compute_dsm_settlement(captive_actual: float, scheduled: float,
+                           cr: float, avail_cap: float) -> dict:
+    """CERC DSM 2024 three-band settlement for one 15-min block."""
+    act_mwh = captive_actual * DT
+    sch_mwh = scheduled * DT
+    dws     = (captive_actual - scheduled) * DT
+    pct     = abs(dws) / avail_cap * 100.0 if avail_cap > 0 else 0.0
+    over    = dws > 0
+
+    if pct <= 10.0:
+        rate, mult, band = cr,        1.0,  "0-10%"
+    elif pct <= 15.0:
+        rate, mult, band = (0.90*cr, 0.90, "10-15%") if over \
+                      else (1.10*cr, 1.10, "10-15%")
+    else:
+        rate, mult, band = (0.0,    0.0,  ">15%") if over \
+                      else (1.50*cr, 1.50, ">15%")
+
+    direction = "within" if pct <= 10 else ("over" if over else "under")
+    r = {
         "dws_mwh": dws, "dws_pct": pct, "band": band,
-        "direction": "within" if pct <= 10 else ("over" if is_over else "under"),
-        "charge_rate": cr, "charge_rate_mult": mult,
+        "direction": direction, "charge_rate": rate, "charge_rate_mult": mult,
         "net_captive_cash": 0.0, "dsm_penalty": 0.0, "dsm_haircut": 0.0,
         "financial_damage": 0.0,
         "under_revenue_received": 0.0, "under_dsm_penalty": 0.0,
@@ -90,17 +130,15 @@ def compute_dsm_settlement(cap_act: float, sched_total: float,
         "over_total_received": 0.0, "over_if_all_cr": 0.0, "over_haircut": 0.0,
     }
     if pct <= 10.0:
-        r["net_captive_cash"] = act_mwh * CR
+        r["net_captive_cash"] = act_mwh * cr
     elif dws < 0:
-        rev = act_mwh * CR; pen = abs(dws) * cr; net = rev - pen
-        ifs = sch_mwh * CR
+        rev = act_mwh*cr; pen = abs(dws)*rate; net = rev-pen; ifs = sch_mwh*cr
         r.update({"under_revenue_received": rev, "under_dsm_penalty": pen,
                   "under_net_cash": net, "under_if_fully_sched": ifs,
-                  "under_damage": ifs - net, "net_captive_cash": net,
-                  "dsm_penalty": pen, "financial_damage": ifs - net})
+                  "under_damage": ifs-net, "net_captive_cash": net,
+                  "dsm_penalty": pen, "financial_damage": ifs-net})
     else:
-        rs = sch_mwh * CR; rd = dws * cr; tr = rs + rd
-        ia = act_mwh * CR; hc = max(0.0, ia - tr)
+        rs = sch_mwh*cr; rd = dws*rate; tr = rs+rd; ia = act_mwh*cr; hc = max(0.0,ia-tr)
         r.update({"over_revenue_sched": rs, "over_revenue_dev": rd,
                   "over_total_received": tr, "over_if_all_cr": ia,
                   "over_haircut": hc, "net_captive_cash": tr, "dsm_haircut": hc})
@@ -108,473 +146,721 @@ def compute_dsm_settlement(cap_act: float, sched_total: float,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 1: Day-Ahead MILP
+# STAGE 1
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TwoStageBESS:
-    def __init__(self, params: Any, config: Dict[str, Any]):
-        self.params = params
-        self.config = config
-        self.lambda_risk = config.get("lambda_risk", 0.0)
-        self.risk_alpha = config.get("risk_alpha", 0.1)
+class TwoStageBESSRTC:
+    """
+    Stage 1 MILP — D-1 10:00 IST.
 
-    def solve(self, dam_scenarios: np.ndarray, rtm_scenarios: np.ndarray,
-              solar_da: np.ndarray) -> Dict[str, Any]:
-        """Stage 1: D-1 MILP. Commits x_c, x_d, solar routing. No y_c/y_d."""
-        S = dam_scenarios.shape[0]
-        p = self.params
-        p_max = p.p_max_mw
-        S_inv = p.solar_inverter_mw
-        r_ppa = p.ppa_rate_rs_mwh
-        USABLE = p.e_max_mwh - p.e_min_mwh
-        solar_da = np.clip(solar_da, 0.0, S_inv)
-        solar_mask = compute_solar_band_mask(
+    Selects RTC_committed ∈ [rtc_min_mw=1.0, rtc_mw=5.0] MW and the
+    DAM IEX arbitrage schedule simultaneously.
+
+    C_RTC (hard equality): s_cd[t]+c_d[t] == RTC_c ∀t  →  FLAT delivery
+    C3 (DC-coupled topology): x_c[t]+s_c[t] ≤ p_max×delta[t]  (s_c through PCS)
+    C5: soc[s][0]==40 AND soc[s][96]==40 MWh (hard SOD=EOD)
+    C7: Σ(x_d+c_d)×DT/η_d ≤ USABLE=72 MWh  (1 cycle/day per scenario)
+    C_PSHORT: p_short[t] ≥ 4.0 − (s_cd[t]+c_d[t])  [4.0 = 0.80×5.0 FIXED]
+    """
+
+    def __init__(self, params, config: Dict):
+        self.p           = params
+        self.lambda_risk = config.get("lambda_risk", 0.0)
+        self.risk_alpha  = config.get("risk_alpha",  0.10)
+
+    def solve(self, dam_scenarios: np.ndarray,
+              rtm_scenarios: np.ndarray,
+              solar_da:      np.ndarray) -> Dict:
+        p      = self.p
+        S      = dam_scenarios.shape[0]
+        p_max  = p.p_max_mw
+        dc_con = p.dc_con_mw
+        r_ppa  = p.ppa_rate_rs_mwh
+        USABLE = p.usable_energy_mwh                 # = 72 MWh
+        THRESHOLD = p.THRESHOLD
+
+        solar_da   = np.clip(solar_da, 0.0, dc_con)
+        solar_mask = compute_solar_band_mask_rtc(
             solar_da, p.solar_threshold_mw, p.solar_buffer_blocks)
 
-        prob = pulp.LpProblem("Stage1", pulp.LpMaximize)
-        x_c = pulp.LpVariable.dicts("xc", range(T_BLOCKS), 0, p_max)
-        x_d = pulp.LpVariable.dicts("xd", range(T_BLOCKS), 0, p_max)
-        s_c = pulp.LpVariable.dicts("sc", range(T_BLOCKS), 0, p_max)
-        s_cd = pulp.LpVariable.dicts("scd", range(T_BLOCKS), 0, S_inv)
-        c_d = pulp.LpVariable.dicts("cd", range(T_BLOCKS), 0, p_max)
-        delta = pulp.LpVariable.dicts("d", range(T_BLOCKS), cat="Binary")
-        soc = {si: pulp.LpVariable.dicts(
-            f"soc{si}", range(T_BLOCKS + 1), p.e_min_mwh, p.e_max_mwh)
-            for si in range(S)}
-        zeta = pulp.LpVariable("zeta")
-        u = pulp.LpVariable.dicts("u", range(S), 0)
-        scen_revs = []
+        prob  = pulp.LpProblem("Stage1_RTC", pulp.LpMaximize)
 
+        # ── First-stage variables (shared across all scenarios) ───────────
+        RTC_c   = pulp.LpVariable("RTC_c", lowBound=p.rtc_min_mw, upBound=p.rtc_mw)
+        x_c     = pulp.LpVariable.dicts("xc",  range(T_BLOCKS), 0, p_max)
+        x_d     = pulp.LpVariable.dicts("xd",  range(T_BLOCKS), 0, p_max)
+        s_c     = pulp.LpVariable.dicts("sc",  range(T_BLOCKS), 0, p_max)
+        s_cd    = pulp.LpVariable.dicts("scd", range(T_BLOCKS), 0, dc_con)
+        c_d     = pulp.LpVariable.dicts("cd",  range(T_BLOCKS), 0, p_max)
+        p_short = pulp.LpVariable.dicts("psh", range(T_BLOCKS), 0)
+        delta   = pulp.LpVariable.dicts("dlt", range(T_BLOCKS), cat="Binary")
+
+        # ── Scenario variables ────────────────────────────────────────────
+        soc  = {si: pulp.LpVariable.dicts(f"soc{si}", range(T_BLOCKS+1),
+                                           p.e_min_mwh, p.e_max_mwh)
+                for si in range(S)}
+        zeta = pulp.LpVariable("zeta")
+        u    = pulp.LpVariable.dicts("u", range(S), lowBound=0)
+
+        # ── C1, C_RTC, C_PSHORT, C2, C3 — added ONCE (not per scenario) ─
+        for t in range(T_BLOCKS):
+            sol_t = float(solar_da[t])
+
+            # C1: solar balance — no curtailment
+            prob += s_c[t] + s_cd[t] == sol_t,                      f"C1_{t}"
+
+            # C_RTC: flat constant delivery — the HEART of RTC
+            # Night: s_cd=0 ⟹ c_d == RTC_c (BESS alone)
+            # Day:   solar covers some, c_d tops up exactly to RTC_c
+            prob += s_cd[t] + c_d[t] == RTC_c,                      f"CRTC_{t}"
+
+            # C_PSHORT: linearised penalty below FIXED 4 MW threshold
+            # Since C_RTC forces delivery==RTC_c, p_short = max(0, 4-RTC_c)
+            # which is 0 when RTC_c≥4 and positive on very-low-SoC days
+            prob += p_short[t] >= THRESHOLD - (s_cd[t] + c_d[t]),    f"CPSH_{t}"
+
+            # C2: PCS discharge limit
+            prob += x_d[t] + c_d[t] + s_cd[t] <= p_max,              f"C2_{t}"
+
+            # C3: AC bus mutual exclusion
+            # Topology: Solar→DC-DC→DC Bus←BESS→PCS→AC Bus→Grid/Captive
+            # s_c (solar→BESS via DC-DC) is a SEPARATE path from the PCS AC bus.
+            # s_c can flow simultaneously with s_cd (solar splits at DC bus).
+            # Only x_c (grid→BESS via PCS AC) is mutex with export mode.
+            # This allows BESS to recharge from solar surplus during export blocks,
+            # which is physically required for C5 (SOD=EOD=40) to be satisfiable.
+            prob += x_c[t]             <= p_max * delta[t],          f"C3a_{t}"
+            prob += x_d[t] + c_d[t] + s_cd[t] <= p_max*(1-delta[t]), f"C3b_{t}"
+            prob += s_cd[t] <= dc_con * (1 - delta[t]),               f"C3c_{t}"
+
+        # ── Per-scenario constraints ───────────────────────────────────────
+        scen_revs = []
         for si in range(S):
-            prob += soc[si][0] == p.soc_initial_mwh
-            prob += soc[si][T_BLOCKS] == p.soc_terminal_min_mwh
-            rev = 0
-            for t in range(T_BLOCKS):
-                pd_t = float(dam_scenarios[si, t])
-                # C4: SoC dynamics
-                prob += soc[si][t + 1] == (
-                    soc[si][t]
-                    + p.eta_charge * (s_c[t] + x_c[t]) * DT
-                    - (1.0 / p.eta_discharge) * (x_d[t] + c_d[t]) * DT)
-                # Objective terms
-                rev += pd_t * x_d[t] * DT - pd_t * x_c[t] * DT
-                rev += r_ppa * (s_cd[t] + c_d[t]) * DT
-                rev -= p.iex_fee_rs_mwh * (x_c[t] + x_d[t]) * DT
-                # C6: SoC solar band
-                if solar_mask[t]:
-                    prob += soc[si][t] >= p.soc_solar_low
-                    prob += soc[si][t] <= p.soc_solar_high
-            # C7: Max 1 cycle per day (DISCHARGE side)
+
+            # C5: SOD = EOD = 40 MWh (hard equality)
+            prob += soc[si][0]        == p.soc_initial_mwh,          f"SOD_{si}"
+            prob += soc[si][T_BLOCKS] == p.soc_terminal_min_mwh,     f"EOD_{si}"
+
+            # C7: max 1 cycle per day = USABLE = 72 MWh discharge throughput
             prob += pulp.lpSum(
                 [(x_d[t] + c_d[t]) * DT / p.eta_discharge
                  for t in range(T_BLOCKS)]
-            ) <= USABLE, f"cycle_{si}"
+            ) <= USABLE,                                              f"C7_{si}"
+
+            rev = 0
+            for t in range(T_BLOCKS):
+                pd_t = float(dam_scenarios[si, t])
+
+                # C4: SoC dynamics
+                prob += soc[si][t+1] == (
+                    soc[si][t]
+                    + p.eta_charge    * (s_c[t] + x_c[t]) * DT
+                    - (1.0/p.eta_discharge) * (x_d[t] + c_d[t]) * DT
+                ),                                                    f"C4_{si}_{t}"
+
+                # C6: SoC solar band
+                if solar_mask[t]:
+                    prob += soc[si][t] >= p.soc_solar_low,           f"C6lo_{si}_{t}"
+                    prob += soc[si][t] <= p.soc_solar_high,          f"C6hi_{si}_{t}"
+                # Outside solar band: no additional constraint — BESS free [e_min,e_max]
+
+                # Revenue
+                rev += pd_t  * x_d[t]              * DT  # DAM sell
+                rev -= pd_t  * x_c[t]              * DT  # DAM buy
+                rev += r_ppa * (s_cd[t] + c_d[t])  * DT  # PPA on flat RTC delivery
+                rev -= p.iex_fee_rs_mwh*(x_c[t]+x_d[t])* DT  # IEX fees
+                rev -= r_ppa * p_short[t]           * DT  # C_PSHORT penalty
+
             prob += u[si] >= zeta - rev
             scen_revs.append(rev)
 
-        for t in range(T_BLOCKS):
-            sol_t = float(solar_da[t])
-            # C1: Solar balance
-            prob += s_c[t] + s_cd[t] == sol_t
-            # C2: PCS discharge limit
-            prob += x_d[t] + c_d[t] <= p_max
-            # C3: Binary mutual exclusion
-            prob += x_c[t] + s_c[t] <= p_max * delta[t]
-            prob += x_d[t] + c_d[t] <= p_max * (1 - delta[t])
-            prob += s_cd[t] <= S_inv * (1 - delta[t])
-
+        # ── Objective ─────────────────────────────────────────────────────
         avg_rev = pulp.lpSum(scen_revs) / S
-        cvar = zeta - (1.0 / (S * self.risk_alpha)) * pulp.lpSum(
-            [u[si] for si in range(S)])
+        cvar    = zeta - (1.0/(S*self.risk_alpha)) * pulp.lpSum(u.values())
         prob.setObjective(avg_rev + self.lambda_risk * cvar)
         prob.solve(pulp.PULP_CBC_CMD(msg=0))
 
+        z96 = [0.0] * T_BLOCKS
         if pulp.LpStatus[prob.status] != "Optimal":
-            z = [0.0] * T_BLOCKS
-            return {"status": "Infeasible", "x_c": z, "x_d": z,
-                    "s_c_da": z, "s_cd_da": z, "c_d_da": z,
-                    "captive_da": z, "schedule_da": z, "setpoint_da": z,
-                    "dam_schedule": z, "expected_revenue": 0.0,
-                    "solar_band_mask": [], "scenarios": []}
+            return {"status": "Infeasible", "RTC_committed": p.rtc_min_mw,
+                    "x_c": z96, "x_d": z96, "s_c_da": z96, "s_cd_da": z96,
+                    "c_d_da": z96, "captive_da": z96, "dam_net": z96,
+                    "schedule_da": z96, "setpoint_da": z96,
+                    "solar_band_mask": [False]*T_BLOCKS, "expected_revenue": 0.0,
+                    "scenarios": []}
 
-        def v(var, t):
-            return max(0.0, pulp.value(var[t]) or 0.0)
-        xc_v = [v(x_c, t) for t in range(T_BLOCKS)]
-        xd_v = [v(x_d, t) for t in range(T_BLOCKS)]
-        sc_v = [v(s_c, t) for t in range(T_BLOCKS)]
-        scd_v = [v(s_cd, t) for t in range(T_BLOCKS)]
-        cd_v = [v(c_d, t) for t in range(T_BLOCKS)]
-        cap_da = [scd_v[t] + cd_v[t] for t in range(T_BLOCKS)]
-        dam_net = [xd_v[t] - xc_v[t] for t in range(T_BLOCKS)]
-        sched_da = [cap_da[t] + dam_net[t] for t in range(T_BLOCKS)]
-        soc_mean = [float(np.mean([pulp.value(soc[si][t]) or 0
-                    for si in range(S)])) for t in range(T_BLOCKS + 1)]
-        sp_da = [compute_setpoint(soc_mean[t], sched_da[t],
-                 p.e_min_mwh, p.e_max_mwh, p.eta_charge, p.eta_discharge)
+        rtc_val = float(pulp.value(RTC_c) or p.rtc_min_mw)
+        xc_v  = [max(0.0, pulp.value(x_c[t]) or 0.0) for t in range(T_BLOCKS)]
+        xd_v  = [max(0.0, pulp.value(x_d[t]) or 0.0) for t in range(T_BLOCKS)]
+        sc_v  = [max(0.0, pulp.value(s_c[t]) or 0.0) for t in range(T_BLOCKS)]
+        scd_v = [max(0.0, pulp.value(s_cd[t])or 0.0) for t in range(T_BLOCKS)]
+        cd_v  = [max(0.0, pulp.value(c_d[t]) or 0.0) for t in range(T_BLOCKS)]
+
+        cap_da   = [scd_v[t] + cd_v[t]  for t in range(T_BLOCKS)]  # = RTC_c ∀t
+        dam_net  = [xd_v[t]  - xc_v[t]  for t in range(T_BLOCKS)]
+        sched_da = [rtc_val  + dam_net[t] for t in range(T_BLOCKS)]
+
+        soc_mean = [float(np.mean([pulp.value(soc[si][t]) or 0.0 for si in range(S)]))
+                    for t in range(T_BLOCKS+1)]
+
+        # FIX-2: setpoint clamped to ±rtc_tol_pct (±5% free band)
+        sp_da = [compute_setpoint_rtc(soc_mean[t], sched_da[t],
+                                      p.e_min_mwh, p.e_max_mwh,
+                                      p.eta_charge, p.eta_discharge,
+                                      p.rtc_tol_pct)
                  for t in range(T_BLOCKS)]
 
         return {
-            "status": "Optimal",
-            "expected_revenue": float(pulp.value(avg_rev) or 0),
+            "status":           "Optimal",
+            "expected_revenue": float(pulp.value(avg_rev) or 0.0),
+            "RTC_committed":    rtc_val,
             "x_c": xc_v, "x_d": xd_v,
             "s_c_da": sc_v, "s_cd_da": scd_v, "c_d_da": cd_v,
-            "captive_da": cap_da, "schedule_da": sched_da, "setpoint_da": sp_da,
-            "dam_schedule": dam_net,
+            "captive_da": cap_da, "dam_net": dam_net,
+            "schedule_da": sched_da, "setpoint_da": sp_da,
             "solar_band_mask": solar_mask.tolist(),
             "scenarios": [{"soc": [pulp.value(soc[si][t])
-                          for t in range(T_BLOCKS + 1)]} for si in range(S)],
+                                   for t in range(T_BLOCKS+1)]}
+                          for si in range(S)],
         }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COMBINED STAGE 2: Joint Solar Routing + RTM (Receding-Horizon MPC)
+# STAGE 2B
 # ══════════════════════════════════════════════════════════════════════════════
 
-def solve_combined_stage2(params, block_B: int, soc_actual_B: float,
-                          dam_actual: np.ndarray, rtm_q50: np.ndarray,
-                          p_rtm_lag4: float,
-                          s_c_rt: np.ndarray, s_cd_rt: np.ndarray,
-                          c_d_rt: np.ndarray,
-                          y_c_committed: np.ndarray,
-                          y_d_committed: np.ndarray,
-                          x_c_s1: np.ndarray, x_d_s1: np.ndarray,
-                          solar_blend: np.ndarray,
-                          captive_committed: np.ndarray,
-                          cycle_used_so_far: float = 0.0) -> Dict[str, Any]:
+def reschedule_captive_rtc(params,
+                            trigger_block:          int,
+                            soc_actual:             float,
+                            solar_nc_row:           np.ndarray,
+                            solar_da:               np.ndarray,
+                            rtm_q50:                np.ndarray,
+                            x_c_s1:                 np.ndarray,
+                            x_d_s1:                 np.ndarray,
+                            y_c_committed:          np.ndarray,
+                            y_d_committed:          np.ndarray,
+                            rtc_committed:          float,
+                            captive_committed_prev: np.ndarray,
+                            rtc_notice:             np.ndarray,
+                            cycle_used_so_far:      float = 0.0) -> Dict:
     """
-    Combined Stage 2: jointly optimize solar routing + RTM bids.
-    Solves over blocks B..95. Commits y_c[B+3], y_d[B+3] only.
-    Updates s_c_rt, s_cd_rt, c_d_rt for all remaining blocks.
+    Stage 2B: revise solar routing with NC nowcast.
+    Runs at trigger blocks {34,42,50,58}. Before Stage 2A at each trigger.
+
+    cap_rt[k] bounds:
+      rtc_notice[t_abs] = True  →  [rtc_min_mw, rtc_mw]  (notice given 16 blk ago)
+      otherwise                 →  [RTC_c×0.95, RTC_c×1.05]  (±5% free band)
+
+    rtc_advance_blocks used: after solving, any cap_rt > ±5% issues
+    rtc_notice[t_abs + rtc_advance_blocks] = True immediately.
     """
-    p = params
-    p_max = p.p_max_mw
-    S_inv = p.solar_inverter_mw
-    r_ppa = p.ppa_rate_rs_mwh
-    USABLE = p.e_max_mwh - p.e_min_mwh
-    RTM_LEAD = p.rtm_lead_blocks
-    CAP_BUF = p.captive_buffer_blocks
-    CAP_TOL = p.captive_buffer_tolerance_mw
-    remaining = T_BLOCKS - block_B
-    if remaining <= 0:
-        return {"status": "Skip", "y_c_bid": 0.0, "y_d_bid": 0.0,
-                "s_c_rt": s_c_rt, "s_cd_rt": s_cd_rt, "c_d_rt": c_d_rt,
-                "captive_rt": (s_cd_rt + c_d_rt).tolist()}
+    p         = params
+    B         = trigger_block
+    remaining = T_BLOCKS - B
+    p_max     = p.p_max_mw
+    dc_con    = p.dc_con_mw
+    r_ppa     = p.ppa_rate_rs_mwh
+    USABLE    = p.usable_energy_mwh
+    RTM_LEAD  = p.rtm_lead_blocks
+    THRESHOLD = p.THRESHOLD
 
-    # Lag-4 RTM price conditioning
-    rtm_adj = rtm_q50.copy().astype(float)
-    if not np.isnan(p_rtm_lag4) and block_B >= 4:
-        bias = p_rtm_lag4 - float(rtm_q50[block_B - 4])
-        for t in range(block_B, T_BLOCKS):
-            rtm_adj[t] = max(0.0, rtm_adj[t] + bias * 0.85 ** (t - block_B))
-
-    # Solar band mask for remaining blocks
-    sol_rem = np.array([float(solar_blend[block_B + k])
-                        for k in range(remaining)])
-    solar_mask_r = compute_solar_band_mask(
-        sol_rem, p.solar_threshold_mw, p.solar_buffer_blocks)
-
-    # Locked IEX from Stage 1
-    xc_r = np.array(x_c_s1[block_B:], dtype=float)
-    xd_r = np.array(x_d_s1[block_B:], dtype=float)
-
-    prob = pulp.LpProblem(f"CS2_B{block_B}", pulp.LpMaximize)
-
-    # Decision variables
-    sc = pulp.LpVariable.dicts("sc", range(remaining), 0, p_max)
-    scd = pulp.LpVariable.dicts("scd", range(remaining), 0, S_inv)
-    cd = pulp.LpVariable.dicts("cd", range(remaining), 0, p_max)
-    y_c = pulp.LpVariable.dicts("yc", range(remaining), 0, p_max)
-    y_d = pulp.LpVariable.dicts("yd", range(remaining), 0, p_max)
-    soc_lp = pulp.LpVariable.dicts("soc", range(remaining + 1),
-                                    p.e_min_mwh, p.e_max_mwh)
-    dl = pulp.LpVariable.dicts("dl", range(remaining), cat="Binary")
-
-    # SoC initial and terminal
-    prob += soc_lp[0] == float(np.clip(soc_actual_B, p.e_min_mwh, p.e_max_mwh))
-    prob += soc_lp[remaining] == p.soc_terminal_min_mwh
-
-    # Lock y_c/y_d for blocks < RTM_LEAD (already committed)
-    for k in range(min(RTM_LEAD, remaining)):
-        t_abs = block_B + k
-        prob += y_c[k] == float(y_c_committed[t_abs])
-        prob += y_d[k] == float(y_d_committed[t_abs])
-
-    rev = 0
+    # Solar blend: NC for next 12 blocks, DA beyond
+    solar_blend = np.zeros(remaining, dtype=float)
     for k in range(remaining):
-        t_abs = block_B + k
-        xc_k = float(xc_r[k])
-        xd_k = float(xd_r[k])
-        sol_k = float(sol_rem[k])
-        pr_k = float(rtm_adj[t_abs])
+        t_abs = B + k
+        solar_blend[k] = (float(solar_nc_row[k]) if k < len(solar_nc_row)
+                          else float(solar_da[t_abs]) if t_abs < T_BLOCKS else 0.0)
+    solar_blend = np.clip(solar_blend, 0.0, dc_con)
+    solar_mask  = compute_solar_band_mask_rtc(solar_da, p.solar_threshold_mw,
+                                               p.solar_buffer_blocks)
 
-        # CS2-1: Solar balance
-        prob += sc[k] + scd[k] == sol_k
+    xc_r  = np.array(x_c_s1[B:], dtype=float)
+    xd_r  = np.array(x_d_s1[B:], dtype=float)
+    yc_r  = np.array(y_c_committed[B:], dtype=float)
+    yd_r  = np.array(y_d_committed[B:], dtype=float)
+    rtm_r = np.array(rtm_q50[B:], dtype=float)
 
-        # CS2-2: PCS charge limit
-        prob += sc[k] + xc_k + y_c[k] <= p_max
+    prob   = pulp.LpProblem(f"S2B_b{B}", pulp.LpMaximize)
+    sc     = pulp.LpVariable.dicts("sc",  range(remaining), 0, p_max)
+    scd    = pulp.LpVariable.dicts("scd", range(remaining), 0, dc_con)
+    cd     = pulp.LpVariable.dicts("cd",  range(remaining), 0, p_max)
+    psh    = pulp.LpVariable.dicts("psh", range(remaining), 0)
+    soc_v  = pulp.LpVariable.dicts("soc", range(remaining+1), p.e_min_mwh, p.e_max_mwh)
+    dl     = pulp.LpVariable.dicts("dl",  range(remaining), cat="Binary")
 
-        # CS2-3: PCS discharge limit
-        prob += cd[k] + xd_k + y_d[k] <= p_max
+    cap_rt = {}
+    for k in range(remaining):
+        t_abs = B + k
+        if rtc_notice[t_abs]:
+            lo, hi = p.rtc_min_mw, p.rtc_mw
+        else:
+            lo, hi = p.rtc_band(rtc_committed)
+        cap_rt[k] = pulp.LpVariable(f"crt_{k}", lowBound=lo, upBound=hi)
 
-        # CS2-4: Binary mutual exclusion
-        prob += xc_k + y_c[k] + sc[k] <= p_max * dl[k]
-        prob += xd_k + y_d[k] + cd[k] <= p_max * (1 - dl[k])
-        prob += scd[k] <= S_inv * (1 - dl[k])
+    prob += soc_v[0] == float(np.clip(soc_actual, p.e_min_mwh, p.e_max_mwh))
+    if p.soc_terminal_mode == "hard":
+        prob += soc_v[remaining] == p.soc_terminal_min_mwh
+    else:
+        prob += soc_v[remaining] >= p.soc_terminal_min_mwh
 
-        # Force delta if locked IEX commits direction
-        if xc_k > 1e-6:
-            prob += dl[k] >= 1
-        elif xd_k > 1e-6:
-            prob += dl[k] <= 0
-
-        # CS2-5: Captive buffer (first 12 blocks frozen ±0.5 MW)
-        if k < CAP_BUF and t_abs < len(captive_committed):
-            ct = float(captive_committed[t_abs])
-            prob += scd[k] + cd[k] >= ct - CAP_TOL
-            prob += scd[k] + cd[k] <= ct + CAP_TOL
-
-        # CS2-6: SoC dynamics
-        prob += soc_lp[k + 1] == (soc_lp[k]
-            + p.eta_charge * (sc[k] + xc_k + y_c[k]) * DT
-            - (1.0 / p.eta_discharge) * (cd[k] + xd_k + y_d[k]) * DT)
-
-        # CS2-8: SoC solar band
-        if solar_mask_r[k]:
-            prob += soc_lp[k] >= p.soc_solar_low
-            prob += soc_lp[k] <= p.soc_solar_high
-
-        # Objective: captive PPA + RTM + locked DAM - IEX fees (ALL throughput)
-        rev += r_ppa * (scd[k] + cd[k]) * DT
-        rev += pr_k * y_d[k] * DT - pr_k * y_c[k] * DT
-        rev += pr_k * xd_k * DT - pr_k * xc_k * DT
-        rev -= p.iex_fee_rs_mwh * (xc_k + xd_k + y_c[k] + y_d[k]) * DT
-
-    # CS2-9: Remaining cycle budget
+    # Remaining cycle budget
     cycle_budget = max(0.0, USABLE - cycle_used_so_far)
     prob += pulp.lpSum(
-        [(cd[k] + float(xd_r[k]) + y_d[k]) * DT / p.eta_discharge
-         for k in range(remaining)]
-    ) <= cycle_budget, "cycle_lim"
+        [(cd[k] + float(xd_r[k]) + (float(yd_r[k]) if k < RTM_LEAD else 0.0))
+         * DT / p.eta_discharge for k in range(remaining)]
+    ) <= cycle_budget, "C7_2b"
+
+    rtc_notice_out = rtc_notice.copy()
+    rev = 0
+
+    for k in range(remaining):
+        t_abs = B + k
+        xc_k  = float(xc_r[k])
+        xd_k  = float(xd_r[k])
+        yc_k  = float(yc_r[k]) if k < RTM_LEAD else 0.0
+        yd_k  = float(yd_r[k]) if k < RTM_LEAD else 0.0
+        pr_k  = float(rtm_r[k])
+        sol_k = float(solar_blend[k])
+
+        # C1
+        prob += sc[k] + scd[k] == sol_k,                      f"C1_{k}"
+        # C_RTC
+        prob += scd[k] + cd[k] == cap_rt[k],                  f"CRTC_{k}"
+        # C_PSHORT (fixed 4 MW)
+        prob += psh[k] >= THRESHOLD - (scd[k] + cd[k]),      f"PSH_{k}"
+        # C2
+        prob += xd_k + yd_k + cd[k] + scd[k] <= p_max,       f"C2_{k}"
+        # C3 (s_c via separate DC-DC path — NOT mutex with export)
+        prob += xc_k + yc_k          <= p_max * dl[k],         f"C3a_{k}"
+        prob += xd_k + yd_k + cd[k] + scd[k] <= p_max*(1-dl[k]), f"C3b_{k}"
+        prob += scd[k] <= dc_con*(1-dl[k]),                   f"C3c_{k}"
+        # Captive buffer (first 12 blocks)
+        if k < p.captive_buffer_blocks:
+            ct = float(captive_committed_prev[t_abs])
+            prob += cap_rt[k] >= ct - p.captive_buffer_tolerance_mw, f"CBlo_{k}"
+            prob += cap_rt[k] <= ct + p.captive_buffer_tolerance_mw, f"CBhi_{k}"
+        # C4: SoC dynamics
+        prob += soc_v[k+1] == (
+            soc_v[k]
+            + p.eta_charge    * (sc[k] + xc_k + yc_k) * DT
+            - (1.0/p.eta_discharge) * (cd[k] + xd_k + yd_k) * DT
+        ),                                                      f"C4_{k}"
+        # C6: solar band
+        if solar_mask[t_abs]:
+            prob += soc_v[k] >= p.soc_solar_low,               f"C6lo_{k}"
+            prob += soc_v[k] <= p.soc_solar_high,              f"C6hi_{k}"
+
+        # Objective
+        rev += r_ppa * (scd[k] + cd[k]) * DT
+        rev += pr_k  * xd_k * DT - pr_k * xc_k * DT
+        rev -= p.iex_fee_rs_mwh * (xc_k + xd_k) * DT
+        rev -= r_ppa * psh[k] * DT
 
     prob.setObjective(rev)
     prob.solve(pulp.PULP_CBC_CMD(msg=0))
     status = pulp.LpStatus[prob.status]
 
-    # Extract results
-    sc_out = s_c_rt.copy()
-    scd_out = s_cd_rt.copy()
-    cd_out = c_d_rt.copy()
-    y_c_bid = 0.0
-    y_d_bid = 0.0
+    sc_out  = np.zeros(T_BLOCKS)
+    scd_out = np.zeros(T_BLOCKS)
+    cd_out  = np.zeros(T_BLOCKS)
+    cap_out = np.full(T_BLOCKS, rtc_committed, dtype=float)
 
     if status == "Optimal":
         for k in range(remaining):
-            t = block_B + k
-            sc_out[t] = max(0.0, pulp.value(sc[k]) or 0.0)
-            scd_out[t] = max(0.0, pulp.value(scd[k]) or 0.0)
-            cd_out[t] = max(0.0, pulp.value(cd[k]) or 0.0)
-        # Committed RTM bid for block B+3
-        bid_idx = RTM_LEAD  # k index for block B+3
-        if bid_idx < remaining:
-            y_c_bid = max(0.0, pulp.value(y_c[bid_idx]) or 0.0)
-            y_d_bid = max(0.0, pulp.value(y_d[bid_idx]) or 0.0)
+            t_abs = B + k
+            sc_out[t_abs]  = max(0.0, pulp.value(sc[k])  or 0.0)
+            scd_out[t_abs] = max(0.0, pulp.value(scd[k]) or 0.0)
+            cd_out[t_abs]  = max(0.0, pulp.value(cd[k])  or 0.0)
+            cap_val        = float(pulp.value(cap_rt[k]) or rtc_committed)
+            cap_out[t_abs] = cap_val
+            # Issue rtc_notice if >5% revision needed (rtc_advance_blocks used here)
+            dev = abs(cap_val - rtc_committed) / (rtc_committed + 1e-9)
+            if dev > p.rtc_tol_pct:
+                t_notice = t_abs + p.rtc_advance_blocks
+                if t_notice < T_BLOCKS:
+                    rtc_notice_out[t_notice] = True
 
-    return {
-        "status": status,
-        "y_c_bid": y_c_bid, "y_d_bid": y_d_bid,
-        "s_c_rt": sc_out, "s_cd_rt": scd_out, "c_d_rt": cd_out,
-        "captive_rt": (scd_out + cd_out).tolist(),
-    }
+    return {"status": status,
+            "s_c_rt": sc_out, "s_cd_rt": scd_out, "c_d_rt": cd_out,
+            "captive_rt": cap_out, "rtc_notice": rtc_notice_out}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ACTUALS SETTLEMENT (Orchestration Loop)
+# STAGE 2A
 # ══════════════════════════════════════════════════════════════════════════════
 
-def evaluate_actuals_solar(params, stage1_result: Dict,
-                           dam_actual: np.ndarray, rtm_actual: np.ndarray,
-                           rtm_q50: np.ndarray,
-                           solar_da: np.ndarray, solar_nc: np.ndarray,
-                           solar_at: np.ndarray,
-                           reschedule_blocks: List[int] = NC_TRIGGER_BLOCKS,
-                           verbose: bool = False) -> Dict[str, Any]:
-    p = params
-    r_ppa = p.ppa_rate_rs_mwh
-    RTM_LEAD = p.rtm_lead_blocks
-    CAP_BUF = p.captive_buffer_blocks
-    avail_cap = p.avail_cap_mwh
+def solve_stage2a_rtc(params,
+                       block_B:           int,
+                       soc_actual_B:      float,
+                       dam_actual:        np.ndarray,
+                       rtm_q50:           np.ndarray,
+                       p_rtm_lag4:        float,
+                       s_c_rt:            np.ndarray,
+                       c_d_rt:            np.ndarray,
+                       y_c_committed:     np.ndarray,
+                       y_d_committed:     np.ndarray,
+                       x_c_s1:            np.ndarray,
+                       x_d_s1:            np.ndarray,
+                       solar_da:          np.ndarray,
+                       rtc_committed:     float,
+                       captive_committed: np.ndarray,
+                       rtc_notice:        np.ndarray,
+                       cycle_used_so_far: float = 0.0) -> Tuple[float, float, np.ndarray]:
+    """
+    Stage 2A: receding-horizon MPC — every block B.
+    Bids y_c/y_d for block B+RTM_LEAD=B+3.
+    Issues rtc_notice[B+k+rtc_advance_blocks] for any >5% revision needed.
+    rtc_advance_blocks = 16 blocks = 4 hours (used here as stated in contract).
+    """
+    p         = params
+    p_max     = p.p_max_mw
+    r_ppa     = p.ppa_rate_rs_mwh
+    USABLE    = p.usable_energy_mwh
+    RTM_LEAD  = p.rtm_lead_blocks
+    THRESHOLD = p.THRESHOLD
+    bid_block = block_B + RTM_LEAD
+    rtc_notice_out = rtc_notice.copy()
 
-    x_c_s1 = np.array(stage1_result["x_c"])
-    x_d_s1 = np.array(stage1_result["x_d"])
-    sc_da = np.array(stage1_result["s_c_da"])
-    scd_da = np.array(stage1_result["s_cd_da"])
-    cd_da = np.array(stage1_result["c_d_da"])
-    cap_da = np.array(stage1_result["captive_da"])
+    if bid_block >= T_BLOCKS:
+        return 0.0, 0.0, rtc_notice_out
 
-    # Initialize with DA plan
-    s_c_rt = sc_da.copy()
-    s_cd_rt = scd_da.copy()
-    c_d_rt = cd_da.copy()
-    y_c_committed = np.zeros(T_BLOCKS)
-    y_d_committed = np.zeros(T_BLOCKS)
-    captive_committed = cap_da.copy()
-    soc_path = np.zeros(T_BLOCKS + 1)
-    soc_path[0] = p.soc_initial_mwh
+    # Lag-4 RTM price bias
+    rtm_adj = rtm_q50.copy().astype(float)
+    if not np.isnan(p_rtm_lag4) and block_B >= 4:
+        bias = p_rtm_lag4 - float(rtm_q50[block_B-4])
+        for t in range(bid_block, T_BLOCKS):
+            rtm_adj[t] = max(0.0, rtm_adj[t] + bias * (0.85 ** (t - block_B)))
 
-    # Solar blend: starts as DA, updated at NC triggers
-    solar_blend = solar_da.copy().astype(float)
+    solar_mask = compute_solar_band_mask_rtc(solar_da, p.solar_threshold_mw,
+                                              p.solar_buffer_blocks)
 
-    # Output arrays
-    s_c_actual_arr = np.zeros(T_BLOCKS)
-    s_cd_actual_arr = np.zeros(T_BLOCKS)
-    c_d_actual_arr = np.zeros(T_BLOCKS)
-    captive_actual_arr = np.zeros(T_BLOCKS)
-    setpoint_arr = np.zeros(T_BLOCKS)
-    schedule_rt_arr = np.zeros(T_BLOCKS)
-    dsm_results = []
-    block_captive_net = np.zeros(T_BLOCKS)
-    block_degradation = np.zeros(T_BLOCKS)
-    block_net_arr = np.zeros(T_BLOCKS)
-    no_bess_dsm_arr = np.zeros(T_BLOCKS)
-    no_bess_rev_arr = np.zeros(T_BLOCKS)
-    cum_discharge_mwh = 0.0
+    # Roll SoC forward B → bid_block using committed flows
+    soc_rf = float(np.clip(soc_actual_B, p.e_min_mwh, p.e_max_mwh))
+    for t in range(block_B, bid_block):
+        xc_t = float(x_c_s1[t]); xd_t = float(x_d_s1[t])
+        yc_t = float(y_c_committed[t]); yd_t = float(y_d_committed[t])
+        sc_t = float(s_c_rt[t]); cd_t = float(c_d_rt[t])
+        ch   = p.eta_charge * (sc_t + xc_t + yc_t) * DT
+        di   = (cd_t + xd_t + yd_t) / p.eta_discharge * DT
+        soc_rf = float(np.clip(soc_rf + ch - di, p.e_min_mwh, p.e_max_mwh))
+
+    remaining = T_BLOCKS - bid_block
+    if remaining <= 0:
+        return 0.0, 0.0, rtc_notice_out
+
+    prob   = pulp.LpProblem(f"S2A_b{block_B}", pulp.LpMaximize)
+    y_c    = pulp.LpVariable.dicts("yc",  range(remaining), 0, p_max)
+    y_d    = pulp.LpVariable.dicts("yd",  range(remaining), 0, p_max)
+    psh    = pulp.LpVariable.dicts("psh", range(remaining), 0)
+    soc_lp = pulp.LpVariable.dicts("soc", range(remaining+1), p.e_min_mwh, p.e_max_mwh)
+    dl     = pulp.LpVariable.dicts("dl",  range(remaining), cat="Binary")
+
+    cap_rt_lp = {}
+    for k in range(remaining):
+        t_abs = bid_block + k
+        if t_abs < T_BLOCKS and rtc_notice[t_abs]:
+            lo, hi = p.rtc_min_mw, p.rtc_mw
+        else:
+            lo, hi = p.rtc_band(rtc_committed)
+        cap_rt_lp[k] = pulp.LpVariable(f"crt_{k}", lowBound=lo, upBound=hi)
+
+    prob += soc_lp[0] == soc_rf
+    if p.soc_terminal_mode == "hard":
+        prob += soc_lp[remaining] == p.soc_terminal_min_mwh
+    else:
+        prob += soc_lp[remaining] >= p.soc_terminal_min_mwh
+
+    # Remaining cycle budget
+    cycle_budget = max(0.0, USABLE - cycle_used_so_far)
+    prob += pulp.lpSum(
+        [(float(c_d_rt[bid_block+k]) + float(x_d_s1[bid_block+k]) + y_d[k])
+         * DT / p.eta_discharge for k in range(remaining)]
+    ) <= cycle_budget, "C7_2a"
+
+    rev = 0
+    for k in range(remaining):
+        ta   = bid_block + k
+        xc_t = float(x_c_s1[ta]); xd_t = float(x_d_s1[ta])
+        sc_t = float(s_c_rt[ta]); cd_t = float(c_d_rt[ta])
+        pr   = float(rtm_adj[ta])
+
+        # PCS charge limit (x_c and y_c only — s_c is separate DC path)
+        prob += xc_t + y_c[k]         <= p_max,              f"PCS_c_{k}"
+        prob += cd_t + xd_t + y_d[k] <= p_max,              f"PCS_d_{k}"
+        # C_RTC at RT level
+        prob += sc_t + cd_t == cap_rt_lp[k],                 f"CRTC_{k}"
+        # C_PSHORT (fixed 4 MW)
+        prob += psh[k] >= THRESHOLD - (sc_t + cd_t),         f"PSH_{k}"
+        # C3 (s_c via separate DC-DC path — NOT mutex with export)
+        prob += xc_t + y_c[k]        <= p_max * dl[k],       f"C3a_{k}"
+        prob += xd_t + y_d[k] + cd_t + sc_t <= p_max*(1-dl[k]), f"C3b_{k}"
+        # C4: SoC dynamics
+        prob += soc_lp[k+1] == (
+            soc_lp[k]
+            + p.eta_charge    * (sc_t + xc_t + y_c[k]) * DT
+            - (1.0/p.eta_discharge) * (cd_t + xd_t + y_d[k]) * DT
+        ),                                                    f"C4_{k}"
+        # C6: solar band
+        if solar_mask[ta]:
+            prob += soc_lp[k] >= p.soc_solar_low,            f"C6lo_{k}"
+            prob += soc_lp[k] <= p.soc_solar_high,           f"C6hi_{k}"
+
+        # Objective
+        rev += pr * y_d[k] * DT - pr * y_c[k] * DT
+        rev += r_ppa * cap_rt_lp[k] * DT
+        rev -= p.iex_fee_rs_mwh * (y_c[k] + y_d[k]) * DT
+        rev -= r_ppa * psh[k] * DT
+
+    prob.setObjective(rev)
+    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+
+    if pulp.LpStatus[prob.status] == "Optimal":
+        y_c_bid = max(0.0, pulp.value(y_c[0]) or 0.0)
+        y_d_bid = max(0.0, pulp.value(y_d[0]) or 0.0)
+        # Issue rtc_notice for any block needing >5% revision (rtc_advance_blocks used)
+        for k in range(remaining):
+            cap_val = float(pulp.value(cap_rt_lp[k]) or rtc_committed)
+            dev = abs(cap_val - rtc_committed) / (rtc_committed + 1e-9)
+            if dev > p.rtc_tol_pct:
+                t_notice = bid_block + k + p.rtc_advance_blocks
+                if t_notice < T_BLOCKS:
+                    rtc_notice_out[t_notice] = True
+        return y_c_bid, y_d_bid, rtc_notice_out
+
+    return 0.0, 0.0, rtc_notice_out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ACTUALS SETTLEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_actuals_rtc(params,
+                          stage1_result:    Dict,
+                          dam_actual:       np.ndarray,
+                          rtm_actual:       np.ndarray,
+                          rtm_q50:          np.ndarray,
+                          solar_da:         np.ndarray,
+                          solar_nc:         np.ndarray,
+                          solar_at:         np.ndarray,
+                          reschedule_blocks: List[int] = RESCHEDULE_BLOCKS,
+                          verbose:          bool = False) -> Dict:
+    """
+    Block-by-block settlement loop.
+
+    Per block steps:
+      1. Stage 2B (at reschedule blocks)
+      2. Stage 2A (every block, bids for B+3)
+      3. Setpoint derivation (schedule × bias_ratio, clamped ±5%)
+      4. Dispatch (Case A surplus / B deficit / C match)
+      5. DSM settlement (CERC 2024 three-band)
+      6. RTC shortfall penalty: max(0, 4.0 − captive_actual) × DT × r_ppa
+      7. IEX P&L
+      8. SoC update
+      9. Block P&L = captive_net − rtc_penalty + iex_net − degradation
+     10. No-BESS counterfactual
+    """
+    p             = params
+    r_ppa         = p.ppa_rate_rs_mwh
+    RTM_LEAD      = p.rtm_lead_blocks
+    avail_cap     = p.avail_cap_mwh
+    rtc_committed = float(stage1_result["RTC_committed"])
+    THRESHOLD     = p.THRESHOLD
+
+    x_c_s1  = np.array(stage1_result["x_c"],    dtype=float)
+    x_d_s1  = np.array(stage1_result["x_d"],    dtype=float)
+    s_c_rt  = np.array(stage1_result["s_c_da"], dtype=float)
+    s_cd_rt = np.array(stage1_result["s_cd_da"],dtype=float)
+    c_d_rt  = np.array(stage1_result["c_d_da"], dtype=float)
+
+    y_c_committed     = np.zeros(T_BLOCKS)
+    y_d_committed     = np.zeros(T_BLOCKS)
+    captive_committed = np.full(T_BLOCKS, rtc_committed, dtype=float)
+    rtc_notice        = np.zeros(T_BLOCKS, dtype=bool)
+    soc_path          = np.zeros(T_BLOCKS + 1)
+    soc_path[0]       = p.soc_initial_mwh
+
+    s_c_act   = np.zeros(T_BLOCKS); s_cd_act  = np.zeros(T_BLOCKS)
+    c_d_act   = np.zeros(T_BLOCKS); cap_act   = np.zeros(T_BLOCKS)
+    setpt     = np.zeros(T_BLOCKS); sch_rt    = np.zeros(T_BLOCKS)
+    bl_capnet = np.zeros(T_BLOCKS); bl_cappen = np.zeros(T_BLOCKS)
+    bl_iex    = np.zeros(T_BLOCKS); bl_deg    = np.zeros(T_BLOCKS)
+    bl_net    = np.zeros(T_BLOCKS)
+    nb_dsm    = np.zeros(T_BLOCKS); nb_rev    = np.zeros(T_BLOCKS)
+    nb_pen    = np.zeros(T_BLOCKS)
+    dsm_res   = []
+    rtc_notice_issued = np.zeros(T_BLOCKS, dtype=bool)
+    rtc_notice_target = np.full(T_BLOCKS, -1, dtype=int)
+    rtc_notice_block  = np.full(T_BLOCKS, -1, dtype=int)
+    cum_disch = 0.0
 
     for B in range(T_BLOCKS):
-        lag4 = float(rtm_actual[B - 4]) if B >= 4 else np.nan
+        lag4 = float(rtm_actual[B-4]) if B >= 4 else np.nan
 
-        # Update solar blend at NC trigger blocks
+        # ── Stage 2B ───────────────────────────────────────────────────────
         if B in reschedule_blocks:
             nc_row = solar_nc[B] if B < len(solar_nc) else np.zeros(12)
-            for k in range(min(12, T_BLOCKS - B)):
-                if k < len(nc_row):
-                    solar_blend[B + k] = float(nc_row[k])
+            r2b = reschedule_captive_rtc(
+                params=p, trigger_block=B, soc_actual=soc_path[B],
+                solar_nc_row=nc_row, solar_da=solar_da, rtm_q50=rtm_q50,
+                x_c_s1=x_c_s1, x_d_s1=x_d_s1,
+                y_c_committed=y_c_committed, y_d_committed=y_d_committed,
+                rtc_committed=rtc_committed,
+                captive_committed_prev=captive_committed.copy(),
+                rtc_notice=rtc_notice, cycle_used_so_far=cum_disch,
+            )
+            if r2b["status"] == "Optimal":
+                s_c_rt[B:]            = r2b["s_c_rt"][B:]
+                s_cd_rt[B:]           = r2b["s_cd_rt"][B:]
+                c_d_rt[B:]            = r2b["c_d_rt"][B:]
+                old_notice            = rtc_notice.copy()
+                rtc_notice            = r2b["rtc_notice"]
+                captive_committed[B:] = r2b["captive_rt"][B:]
+                for tb in range(B, T_BLOCKS):
+                    if rtc_notice[tb] and not old_notice[tb]:
+                        rtc_notice_issued[B] = True
+                        rtc_notice_target[B] = tb
 
-        # Combined Stage 2: joint solar routing + RTM bids
-        res2 = solve_combined_stage2(
-            params=p, block_B=B, soc_actual_B=soc_path[B],
-            dam_actual=dam_actual, rtm_q50=rtm_q50, p_rtm_lag4=lag4,
-            s_c_rt=s_c_rt, s_cd_rt=s_cd_rt, c_d_rt=c_d_rt,
-            y_c_committed=y_c_committed, y_d_committed=y_d_committed,
-            x_c_s1=x_c_s1, x_d_s1=x_d_s1,
-            solar_blend=solar_blend,
-            captive_committed=captive_committed,
-            cycle_used_so_far=cum_discharge_mwh)
+        # ── Stage 2A ───────────────────────────────────────────────────────
+        bid_b = B + RTM_LEAD
+        if bid_b < T_BLOCKS:
+            yc_b, yd_b, rtc_notice = solve_stage2a_rtc(
+                params=p, block_B=B, soc_actual_B=soc_path[B],
+                dam_actual=dam_actual, rtm_q50=rtm_q50, p_rtm_lag4=lag4,
+                s_c_rt=s_c_rt, c_d_rt=c_d_rt,
+                y_c_committed=y_c_committed, y_d_committed=y_d_committed,
+                x_c_s1=x_c_s1, x_d_s1=x_d_s1, solar_da=solar_da,
+                rtc_committed=rtc_committed, captive_committed=captive_committed,
+                rtc_notice=rtc_notice, cycle_used_so_far=cum_disch,
+            )
+            y_c_committed[bid_b] = yc_b
+            y_d_committed[bid_b] = yd_b
 
-        if res2["status"] == "Optimal":
-            s_c_rt = res2["s_c_rt"]
-            s_cd_rt = res2["s_cd_rt"]
-            c_d_rt = res2["c_d_rt"]
-            # Commit RTM bid for B+3
-            bid_b = B + RTM_LEAD
-            if bid_b < T_BLOCKS:
-                y_c_committed[bid_b] = res2["y_c_bid"]
-                y_d_committed[bid_b] = res2["y_d_bid"]
-            # Update captive committed beyond buffer
-            for k in range(CAP_BUF, T_BLOCKS - B):
-                captive_committed[B + k] = float(
-                    res2["s_cd_rt"][B + k] + res2["c_d_rt"][B + k])
+        # ── Step 1: Inputs ─────────────────────────────────────────────────
+        xc_B = float(x_c_s1[B]); xd_B = float(x_d_s1[B])
+        yc_B = float(y_c_committed[B]); yd_B = float(y_d_committed[B])
+        cap_rt_B  = float(s_cd_rt[B] + c_d_rt[B])
+        sch_rt_B  = cap_rt_B + (xd_B - xc_B) + (yd_B - yc_B)
+        sch_rt[B] = sch_rt_B
+        z_at      = float(solar_at[B])
 
-        # ── ACTUALS SETTLEMENT for block B ──
-        xc_B = float(x_c_s1[B])
-        xd_B = float(x_d_s1[B])
-        yc_B = float(y_c_committed[B])
-        yd_B = float(y_d_committed[B])
-        dam_net_B = xd_B - xc_B
-        rtm_net_B = yd_B - yc_B
-        cap_rt_B = float(s_cd_rt[B] + c_d_rt[B])
-        schedule_rt_B = cap_rt_B + dam_net_B + rtm_net_B
-        schedule_rt_arr[B] = schedule_rt_B
+        # Setpoint clamped to ±5% (FIX-2)
+        sp_B = compute_setpoint_rtc(soc_path[B], sch_rt_B,
+                                    p.e_min_mwh, p.e_max_mwh,
+                                    p.eta_charge, p.eta_discharge,
+                                    p.rtc_tol_pct)
+        setpt[B] = sp_B
 
-        # Setpoint from SoC
-        setpoint_B = compute_setpoint(
-            soc_path[B], schedule_rt_B,
-            p.e_min_mwh, p.e_max_mwh, p.eta_charge, p.eta_discharge)
-        setpoint_arr[B] = setpoint_B
+        # SoC reserve guard: cap x_d so BESS keeps enough for remaining RTC night
+        blocks_left     = T_BLOCKS - B
+        rtc_reserve_soc = rtc_committed * blocks_left * DT / p.eta_discharge
+        xd_avail        = max(0.0, (soc_path[B] - rtc_reserve_soc - p.e_min_mwh)
+                              * p.eta_discharge / DT)
+        xd_B            = min(xd_B, xd_avail)  # cap to reserve
 
-        z_at = float(solar_at[B])
-
-        # BESS capacity (c_d_actual = total PCS discharge)
         disch_cap = max(0.0, min(
-            p.p_max_mw,
+            p.p_max_mw - xd_B - yd_B,
             (soc_path[B] - p.e_min_mwh) * p.eta_discharge / DT))
-        charge_cap = max(0.0, min(
-            p.p_max_mw - max(0.0, xc_B) - max(0.0, yc_B),
+        charg_cap = max(0.0, min(
+            p.p_max_mw - xc_B - yc_B,
             (p.e_max_mwh - soc_path[B]) / (p.eta_charge * DT)))
 
-        # Dispatch: z_at vs setpoint
-        if z_at > setpoint_B + 1e-6:
-            s_c_act = min(charge_cap, z_at - setpoint_B)
-            s_cd_act = z_at - s_c_act
-            c_d_act = 0.0
-        elif z_at < setpoint_B - 1e-6:
-            s_cd_act = z_at
-            c_d_act = min(disch_cap, setpoint_B - z_at)
-            s_c_act = 0.0
-        else:
-            s_cd_act = z_at
-            s_c_act = 0.0
-            c_d_act = 0.0
+        # ── Step 2: Dispatch (Case A / B / C) ─────────────────────────────
+        if z_at > sp_B + 1e-6:          # Case A: solar surplus → charge BESS
+            sc_a  = min(charg_cap, z_at - sp_B)
+            scd_a = z_at - sc_a
+            cd_a  = 0.0
+        elif z_at < sp_B - 1e-6:        # Case B: deficit → BESS discharges
+            scd_a = z_at
+            cd_a  = min(disch_cap, sp_B - z_at)
+            sc_a  = 0.0
+        else:                            # Case C: exact match
+            scd_a = z_at; sc_a = 0.0; cd_a = 0.0
 
-        cap_act = s_cd_act + c_d_act
-        s_c_actual_arr[B] = s_c_act
-        s_cd_actual_arr[B] = s_cd_act
-        c_d_actual_arr[B] = c_d_act
-        captive_actual_arr[B] = cap_act
+        cap_a = scd_a + cd_a
+        s_c_act[B] = sc_a; s_cd_act[B] = scd_a
+        c_d_act[B] = cd_a; cap_act[B]  = cap_a
 
-        # Contract rate + DSM
-        CR = compute_contract_rate(
-            captive_committed[B], xd_B, xc_B, yd_B, yc_B,
-            float(dam_actual[B]), float(rtm_actual[B]), r_ppa)
-        dsm = compute_dsm_settlement(cap_act, schedule_rt_B, CR, avail_cap)
-        dsm_results.append(dsm)
-        block_captive_net[B] = dsm["net_captive_cash"]
+        # ── Step 3: DSM settlement ─────────────────────────────────────────
+        cr  = compute_contract_rate(rtc_committed, xd_B, yd_B,
+                                    float(dam_actual[B]), float(rtm_actual[B]), r_ppa)
+        dsm = compute_dsm_settlement(cap_a, sch_rt_B, cr, avail_cap)
+        dsm_res.append(dsm)
 
-        # Degradation on total PCS discharge
-        block_degradation[B] = p.degradation_cost_rs_mwh * c_d_act * DT
+        # ── Step 4: RTC shortfall penalty (FIXED 4 MW threshold) ──────────
+        short_mw  = max(0.0, THRESHOLD - cap_a)
+        short_mwh = short_mw * DT
+        rtc_pen   = short_mwh * r_ppa                  # Rs
+        bl_cappen[B] = rtc_pen
+        bl_capnet[B] = dsm["net_captive_cash"] - rtc_pen
 
-        # Block P&L = captive_net - degradation (no separate iex_net)
-        block_net_arr[B] = block_captive_net[B] - block_degradation[B]
+        # ── Step 5: IEX ────────────────────────────────────────────────────
+        iex_dam  = float(dam_actual[B]) * (xd_B - xc_B) * DT
+        iex_rtm  = float(rtm_actual[B]) * (yd_B - yc_B) * DT
+        iex_fees = p.iex_fee_rs_mwh * (xc_B + xd_B + yc_B + yd_B) * DT
+        bl_iex[B] = iex_dam + iex_rtm - iex_fees
 
-        # SoC update: c_d_actual is total PCS discharge
-        ch_e = p.eta_charge * (s_c_act + xc_B + yc_B) * DT
-        dis_e = c_d_act / p.eta_discharge * DT
-        soc_path[B + 1] = float(np.clip(
-            soc_path[B] + ch_e - dis_e, p.e_min_mwh, p.e_max_mwh))
+        # ── Step 6: SoC update ─────────────────────────────────────────────
+        tot_d = xd_B + cd_a + yd_B
+        ch_e  = p.eta_charge * (sc_a + xc_B + yc_B) * DT
+        di_e  = tot_d / p.eta_discharge * DT
+        soc_path[B+1] = float(np.clip(
+            soc_path[B] + ch_e - di_e, p.e_min_mwh, p.e_max_mwh))
+        cum_disch += tot_d * DT / p.eta_discharge
 
-        # Track cycle budget
-        cum_discharge_mwh += c_d_act * DT / p.eta_discharge
+        # ── Step 7: Block P&L ──────────────────────────────────────────────
+        deg       = p.degradation_cost_rs_mwh * tot_d * DT
+        bl_deg[B] = deg
+        bl_net[B] = bl_capnet[B] + bl_iex[B] - deg
 
-        # No-BESS counterfactual
-        nb_dsm = compute_dsm_settlement(z_at, float(captive_committed[B]),
-                                         r_ppa, avail_cap)
-        no_bess_dsm_arr[B] = nb_dsm["dsm_penalty"] + nb_dsm["dsm_haircut"]
-        no_bess_rev_arr[B] = nb_dsm["net_captive_cash"]
+        # ── Step 8: No-BESS counterfactual ────────────────────────────────
+        nb_d   = compute_dsm_settlement(z_at, float(captive_committed[B]), r_ppa, avail_cap)
+        nb_pen[B] = max(0.0, THRESHOLD - z_at) * DT * r_ppa
+        nb_dsm[B] = nb_d["dsm_penalty"] + nb_d["dsm_haircut"]
+        nb_rev[B] = z_at * DT * r_ppa - nb_dsm[B] - nb_pen[B]
 
-        if verbose and B % 24 == 0:
-            print(f"  B={B:2d} soc={soc_path[B]:.2f}→{soc_path[B+1]:.2f} "
-                  f"sp={setpoint_B:.2f} z={z_at:.2f} cap={cap_act:.2f} "
-                  f"net=Rs{block_net_arr[B]:,.0f}")
+        if verbose and B % 16 == 0:
+            print(f"  B={B:02d} soc={soc_path[B]:.1f}→{soc_path[B+1]:.1f} "
+                  f"sol={z_at:.2f} cap={cap_a:.2f} pen=₹{rtc_pen:,.0f} "
+                  f"iex=₹{bl_iex[B]:,.0f} net=₹{bl_net[B]:,.0f}")
 
-    total_cap_net = float(np.sum(block_captive_net))
-    total_deg = float(np.sum(block_degradation))
+    with_dsm      = sum(d["dsm_penalty"] + d["dsm_haircut"] for d in dsm_res)
+    bess_dsm_sav  = float(np.sum(nb_dsm)) - with_dsm
+    bess_pen_sav  = float(np.sum(nb_pen)) - float(np.sum(bl_cappen))
 
     return {
-        "revenue": total_cap_net,
-        "net_revenue": total_cap_net - total_deg,
-        "y_c": y_c_committed, "y_d": y_d_committed,
-        "s_c_rt": s_c_rt, "s_cd_rt": s_cd_rt, "c_d_rt": c_d_rt,
-        "s_c_actual": s_c_actual_arr, "s_cd_actual": s_cd_actual_arr,
-        "c_d_actual": c_d_actual_arr, "captive_actual": captive_actual_arr,
+        "net_revenue":           float(np.sum(bl_net)),
+        "captive_net_total":     float(np.sum(bl_capnet)),
+        "iex_net_total":         float(np.sum(bl_iex)),
+        "rtc_penalty_total":     float(np.sum(bl_cappen)),
+        "degradation_total":     float(np.sum(bl_deg)),
+        "no_bess_revenue_total": float(np.sum(nb_rev)),
+        "bess_dsm_savings":      bess_dsm_sav,
+        "bess_rtc_pen_savings":  bess_pen_sav,
+        "bess_total_value":      bess_dsm_sav + bess_pen_sav
+                                 + float(np.sum(bl_iex))
+                                 - float(np.sum(bl_deg)),
+        "soc_path":              soc_path,
+        "s_c_actual":  s_c_act,    "s_cd_actual":  s_cd_act,
+        "c_d_actual":  c_d_act,    "captive_actual": cap_act,
+        "setpoint":    setpt,       "schedule_rt":   sch_rt,
         "captive_committed": captive_committed,
-        "setpoint_rt": setpoint_arr, "schedule_rt": schedule_rt_arr,
-        "soc_path": soc_path, "soc": soc_path.tolist(),
-        "z_nc_blend": solar_blend,
-        "block_captive_net": block_captive_net,
-        "block_degradation": block_degradation,
-        "block_net": block_net_arr,
-        "dsm_results": dsm_results,
-        "no_bess_dsm": no_bess_dsm_arr, "no_bess_revenue": no_bess_rev_arr,
-        "total_dsm_mwh": 0.0,
-        "fees_breakdown": {"captive_net": total_cap_net,
-                           "total_degradation": total_deg},
+        "block_captive_net":     bl_capnet,
+        "block_captive_penalty": bl_cappen,
+        "block_iex_net":         bl_iex,
+        "block_degradation":     bl_deg,
+        "block_net":             bl_net,
+        "no_bess_dsm":           nb_dsm,
+        "no_bess_rtc_penalty":   nb_pen,
+        "no_bess_revenue":       nb_rev,
+        "dsm_results":           dsm_res,
+        "rtc_notice_issued":     rtc_notice_issued,
+        "rtc_notice_target":     rtc_notice_target,
+        "x_c":  x_c_s1,  "x_d":  x_d_s1,
+        "y_c":  y_c_committed, "y_d": y_d_committed,
+        "s_c_rt": s_c_rt, "s_cd_rt": s_cd_rt, "c_d_rt": c_d_rt,
+        "C_RTC_da":          stage1_result.get("C_RTC_da", stage1_result.get("captive_da", [])),
+        "C_RTC_rt":          captive_committed,
+        "captive_committed": captive_committed,
+        "rtc_notice_block":  rtc_notice_block,
+        "THRESHOLD":         THRESHOLD,
     }
