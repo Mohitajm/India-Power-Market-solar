@@ -1,33 +1,27 @@
-# config/phase3b_rtc.yaml — Architecture v10 RTC FINAL
-# Phase 3B Solar+BESS RTC Backtest Settings
-#
-# CORRECTIONS vs previous version:
-#   1. solar_*_path updated to Data/Solar/rtc/ (new 25.4 MWp / 16.4 MW parquets)
-#      Run: python scripts/build_solar_profiles_rtc.py --start YYYY-MM-DD --end YYYY-MM-DD
-#      If Data/Solar/rtc/ parquets do not yet exist, the runner auto-detects old
-#      Data/Solar/ parquets and applies 0.656 scale factor as a fallback.
-#   2. lambda_dev and dev_max_mw removed — not used by RTC optimizer (orphaned keys)
+# config/phase3b_rtc.yaml — Architecture v10 RTC FINAL (Reverse DC System)
 
-solver: CBC
 n_scenarios: 100
 lambda_risk: 0.0
-risk_alpha: 0.1
-
-# Stage 2B reschedule blocks (IST approx: 08:30, 10:30, 12:30, 14:30)
+risk_alpha: 0.10
 reschedule_blocks: [34, 42, 50, 58]
 
 paths:
-  # ── Price / scenario data (unchanged from v9) ──────────────────────────────
+  # Price scenarios (from ML pipeline)
   scenarios_dam:   Data/Predictions/joint_dam_scenarios_backtest_recalibrated.parquet
   scenarios_rtm:   Data/Predictions/joint_rtm_scenarios_backtest_recalibrated.parquet
+
+  # Price actuals
   actuals_dam:     Data/Predictions/dam_quantiles_backtest.csv
   actuals_rtm:     Data/Predictions/rtm_quantiles_backtest.csv
+
+  # True 15-min IEX prices (used for actual settlement)
   price_parquet:   Data/Cleaned/price/iex_prices_combined_filled.parquet
 
-  # ── Solar parquets — RTC plant (25.4 MWp DC / 16.4 MW AC) ─────────────────
+  # Solar profiles — RTC parquets (scale=1.0, dc_con=16.4 MW)
+  # Run build_solar_profiles_rtc.py first if these don't exist
   solar_da_path:   Data/Solar/rtc/solar_da_rtc.parquet
   solar_nc_path:   Data/Solar/rtc/solar_nc_rtc.parquet
   solar_at_path:   Data/Solar/rtc/solar_actuals_rtc.parquet
 
-  # ── Results ────────────────────────────────────────────────────────────────
+  # Results output directory
   results_dir:     results/phase3b_rtc
