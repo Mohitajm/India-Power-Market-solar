@@ -5,20 +5,22 @@ data:
   price_file: price/iex_prices_combined_filled.parquet
   bid_stack_file: bid_stack/iex_aggregate_combined_filled.parquet
   grid_file: grid/nerldc_national_hourly.parquet
-  weather_file: weather/weather_2022-04-01_to_2025-12-31.parquet
+  weather_file: weather/weather_2025-01-01_to_2026-02-28.parquet
   holiday_file: Data/Raw/holiday_calendar/indian_holidays.csv
 
 # ─── Temporal Splits ───
 splits:
   train:
-    start: "2022-04-01"
-    end: "2024-09-30"
+    start: "2025-01-01"
+    end:   "2025-09-30"
   validation:
-    start: "2024-10-01"
-    end: "2025-01-31"
+    start: "2025-10-01"
+    end:   "2025-12-31"
   backtest:
-    start: "2025-02-01"
-    end: "2025-06-24"
+    start: "2026-01-01"
+    end:   "2026-02-27"
+
+
 
 # ─── Resolution ───
 resolution: 15min
