@@ -1,5 +1,5 @@
 """
-pipeline.py — 15-minute block resolution.
+src/features/pipeline.py — 15-minute block resolution.
 
 Key changes vs. the hourly version
 ────────────────────────────────────
@@ -13,6 +13,18 @@ Key changes vs. the hourly version
 6. cal_hour / target_hour in calendar merge → ts still aligns on full hour
    (calendar_features already works on the timestamp index; no changes needed)
 7. D+1 DAM features       : target_block column added; complete-day filter 96
+
+Phase 2 additions (vs original)
+─────────────────────────────────
+• Reservoir parquet loaded optionally from
+  Data/Cleaned/grid/cwc_reservoir_weekly.parquet and passed to
+  build_grid_features() as reservoir_df.
+• rtm_passthrough_cols extended with all new instantaneous grid signals
+  (frequency, hydro, gas, transnational, reservoir) so they receive the
+  correct 1h lag for RTM.
+• D+1 calendar re-merge: explicitly drops delivery_start_ist that was
+  added to expanded by the DAM calendar merge, preventing MergeError
+  in pandas 2.x.
 """
 
 import pandas as pd
@@ -53,9 +65,24 @@ def build_all_features(config_path):
     loader = DataLoader(config_path)
     data   = loader.load_all()
 
+    # ── Phase 2: Optional CWC Reservoir parquet (Priority 5) ──────────────
+    # Expected: Data/Cleaned/grid/cwc_reservoir_weekly.parquet
+    # Columns : date (YYYY-MM-DD), reservoir_pct (0-100)
+    # If absent, reservoir features are silently skipped inside
+    # build_grid_features() — no error is raised.
+    reservoir_df   = None
+    reservoir_path = root_dir / 'Data' / 'Cleaned' / 'grid' / 'cwc_reservoir_weekly.parquet'
+    if reservoir_path.exists():
+        reservoir_df = pd.read_parquet(reservoir_path)
+        print(f"Reservoir parquet loaded: {len(reservoir_df)} weekly rows")
+    else:
+        print(f"Reservoir parquet not found at {reservoir_path} — Priority 5 skipped.")
+
     # ── Market-independent base features ──────────────────────────────────
     print("Building base features (grid, weather, calendar)...")
-    grid_feats    = build_grid_features(data['grid'])
+
+    # Phase 2: pass reservoir_df to enable Priority 5 features
+    grid_feats    = build_grid_features(data['grid'], reservoir_df=reservoir_df)
     weather_feats = build_weather_features(data['weather'])
 
     # Calendar is driven from the (expanded) grid delivery_start_ist
@@ -119,15 +146,33 @@ def build_all_features(config_path):
 
         # ── RTM branch ────────────────────────────────────────────────────
         if market == 'rtm':
-            # Grid / weather passthrough: shift 1 HOUR = 4 blocks
-            # (was shift(1) over hourly rows; same wall-clock lag)
+            # Grid / weather passthrough: shift 1 HOUR = 4 blocks.
+            # Only "instantaneous" features are listed here.
+            # Pre-lagged features (grid_freq_lag_1h, grid_hydro_lag_24h, etc.)
+            # are excluded — they already carry the correct temporal offset.
             rtm_passthrough_cols = [
+                # ── Original grid signals ─────────────────────────────────
                 'grid_demand_mw', 'grid_net_demand_mw', 'grid_solar_mw',
                 'grid_wind_mw', 'grid_total_gen_mw', 'grid_fuel_mix_imputed',
                 'grid_demand_gen_gap', 'grid_thermal_util', 'grid_renewable_share',
+                # ── Phase 2: frequency (Priority 1) ──────────────────────
+                'grid_frequency_hz', 'grid_freq_deviation',
+                'grid_freq_deficit_flag', 'grid_freq_surplus_flag',
+                'grid_freq_rolling_1h',
+                # ── Phase 2: hydro (Priority 2) ──────────────────────────
+                'grid_hydro_mw', 'grid_hydro_share', 'grid_hydro_ramp_1h',
+                # ── Phase 2: gas (Priority 3) ────────────────────────────
+                'grid_gas_mw', 'grid_gas_share',
+                # ── Phase 2: transnational (Priority 4) ──────────────────
+                'grid_net_transnational_mw', 'grid_is_net_importer',
+                # ── Phase 2: reservoir (Priority 5, optional) ────────────
+                'grid_reservoir_storage_pct', 'grid_reservoir_deficit',
+                # ── Original weather signals ──────────────────────────────
                 'wx_national_temp', 'wx_delhi_temp', 'wx_national_shortwave',
                 'wx_chennai_wind', 'wx_national_cloud',
                 'wx_cooling_degree_hours', 'wx_heat_index', 'wx_temp_spread',
+                # ── Phase 2: weather instantaneous ───────────────────────
+                'wx_wind_ramp_1h',
             ]
             valid_cols = [c for c in rtm_passthrough_cols if c in all_feats.columns]
             all_feats[valid_cols] = all_feats[valid_cols].shift(1 * BPH)
@@ -136,14 +181,14 @@ def build_all_features(config_path):
 
             # Metadata
             final_feats['target_date']  = final_feats.index.date.astype(str)
-            # target_block: 1-96 (replaces target_hour 0-23 from the hourly pipeline)
+            # target_block: 1-96 (replaces target_hour 0-23 from hourly pipeline)
             final_feats['target_block'] = (
                 prices_mkt
                 .set_index('delivery_start_ist')['time_block']
                 .reindex(final_feats.index)
             )
 
-            # Enforce complete days: 96 blocks/day (was 24 hours/day)
+            # Enforce complete days: 96 blocks/day
             date_counts = final_feats.groupby('target_date').size()
             valid_dates = date_counts[date_counts == 96].index
             final_feats = final_feats[final_feats['target_date'].isin(valid_dates)]
@@ -187,13 +232,12 @@ def build_all_features(config_path):
             )
 
             # Expand to 96 blocks per target_date
-            # (was 24 hours; now 96 blocks = 24 hours × 4)
-            blocks_df         = pd.DataFrame({'target_block': range(1, 97)})
+            blocks_df           = pd.DataFrame({'target_block': range(1, 97)})
             shared_feats['key'] = 1
             blocks_df['key']    = 1
             expanded = pd.merge(shared_feats, blocks_df, on='key').drop('key', axis=1)
 
-            # Each block maps to: delivery_start_ist = target_date midnight + (block-1)*15min
+            # Each block: delivery_start_ist = target_date midnight + (block-1)*15min
             target_ts = (
                 pd.to_datetime(expanded['target_date'])
                 + pd.to_timedelta((expanded['target_block'] - 1) * 15, unit='min')
@@ -216,14 +260,6 @@ def build_all_features(config_path):
                 expanded = expanded.drop('delivery_start_ist_cal', axis=1)
 
             # ── mcp_same_block_yesterday ──────────────────────────────────
-            # At D-1 08:00 snapshot:
-            #   block ≤ 33  (≤ 08:00 on D-1): the same block on D-1 has
-            #               already cleared  → use D-1, same block
-            #   block  > 33 (> 08:00 on D-1): that block on D-1 has NOT
-            #               cleared yet      → use D-2, same block
-            #
-            # This replaces the hourly  "hour ≤ 8 → D-1 else D-2" logic
-            # with the equivalent block-level threshold.
             price_lookup    = prices_mkt.set_index('delivery_start_ist')['mcp_rs_mwh']
             price_lookup_df = price_lookup.reset_index()
 
@@ -249,7 +285,7 @@ def build_all_features(config_path):
                 how='left',
             )
 
-            # ── Finalise DAM DataFrame ────────────────────────────────────
+            # ── Finalise DAM DataFrame ─────────────────────────────────────
             final_feats = expanded.set_index('target_ts')
             final_feats.index.name = 'delivery_start_ist'
             final_feats['target_date'] = final_feats['target_date'].astype(str)
@@ -280,24 +316,30 @@ def build_all_features(config_path):
             )
             expanded_d1['target_ts'] = target_ts_d1
 
-            # Re-merge calendar for D+1 dates
-            cal_cols_to_drop = [c for c in expanded_d1.columns if c.startswith('cal_')]
-            expanded_d1 = expanded_d1.drop(columns=cal_cols_to_drop)
+            # Re-merge calendar for D+1 dates.
+            # FIX: drop both cal_cols AND delivery_start_ist before the merge.
+            # The delivery_start_ist column was added to expanded by the DAM
+            # calendar merge above. expanded_d1.copy() carries it over. When
+            # we merge with cal_data (which also has delivery_start_ist as its
+            # join key), pandas 2.x raises MergeError on the duplicate column.
+            cols_to_drop_d1 = (
+                [c for c in expanded_d1.columns if c.startswith('cal_')]
+                + ['delivery_start_ist']
+            )
+            expanded_d1 = expanded_d1.drop(columns=cols_to_drop_d1, errors='ignore')
             expanded_d1 = pd.merge(
                 expanded_d1, cal_data,
                 left_on='target_ts', right_on='delivery_start_ist',
                 how='left',
             )
-            if 'delivery_start_ist' in expanded_d1.columns and \
-               'target_ts' in expanded_d1.columns:
-                expanded_d1 = expanded_d1.drop(
-                    columns=['delivery_start_ist'], errors='ignore'
-                )
+            # Drop the right-side join key — we use target_ts as the index
+            expanded_d1 = expanded_d1.drop(columns=['delivery_start_ist'], errors='ignore')
 
             # mcp_same_block_yesterday for D+1:
-            # At D-1 08:00 snapshot, ALL blocks of D+1 are in the future.
-            # The most recent same-block observation is from D-1 (2 days before D+1).
-            ts_dm1 = expanded_d1['target_ts'] - pd.Timedelta(days=2)
+            # At D-1 08:00 snapshot ALL blocks of D+1 are in the future.
+            # The most recent same-block observation available is D-1
+            # (which is 2 days before D+1).
+            ts_dm1    = expanded_d1['target_ts'] - pd.Timedelta(days=2)
             lookup_d1 = pd.DataFrame({'lookup_ts': ts_dm1}, index=expanded_d1.index)
             merged_d1 = pd.merge(
                 lookup_d1, price_lookup_df,
@@ -315,7 +357,7 @@ def build_all_features(config_path):
                 how='left',
             )
 
-            # Finalise D+1
+            # Finalise D+1 DataFrame
             final_feats_d1 = expanded_d1.set_index('target_ts')
             final_feats_d1.index.name = 'delivery_start_ist'
             final_feats_d1['target_date'] = final_feats_d1['target_date'].astype(str)
@@ -326,7 +368,7 @@ def build_all_features(config_path):
                 [c for c in drop_d1 if c in final_feats_d1.columns], axis=1
             )
 
-            # Drop NaN / warmup rows
+            # NaN counts and drop
             null_counts_d1 = final_feats_d1.isnull().sum()
             if null_counts_d1.sum() > 0:
                 nonnull = null_counts_d1[null_counts_d1 > 0]
@@ -351,7 +393,7 @@ def build_all_features(config_path):
                 final_feats_d1['target_date'].isin(valid_dates_d1)
             ]
 
-            # ── D+1 split fix (same as hourly version) ─────────────────────
+            # D+1 split
             print("Splitting D+1...")
             val_start     = pd.Timestamp(config['splits']['validation']['start'])
             d1_train_clip = (val_start - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
@@ -394,7 +436,7 @@ def build_all_features(config_path):
         after_len   = len(final_feats)
         print(f"Dropped {before_len - after_len} rows due to warmup/NaNs")
 
-        # Enforce complete days: 96 blocks/day (was 24 for hourly)
+        # Enforce complete days: 96 blocks/day
         date_counts = final_feats.groupby('target_date').size()
         valid_dates = date_counts[date_counts == 96].index
         rows_before = len(final_feats)
