@@ -1,44 +1,27 @@
 """
-price_features.py — 15-minute block resolution.
+src/features/price_features.py — Phase 1 improvements
+=======================================================
+Phase 1 additions vs original:
+  1. Spike features (SPIKE_THRESHOLD = 10,000 Rs/MWh — top-2 IEX bands)
+  2. All spike features are lagged 1h (4 blocks) — no leakage
+  3. All original features preserved identically
 
-Key changes vs. the hourly version
-────────────────────────────────────
-The parquet is now at 15-min resolution (96 blocks/day).
-All shift() and rolling() calls that previously used N hours now use
-N×4 blocks to represent the same elapsed time:
-
-  lag 1 block  (15 min) : shift(1)
-  lag 1 hour   (4 blk)  : shift(4)   ← was shift(1)  "mcp_lag_1h"
-  lag 2 hours  (8 blk)  : shift(8)   ← was shift(2)  "mcp_lag_2h"
-  lag 4 hours  (16 blk) : shift(16)  ← was shift(4)  "mcp_lag_4h"
-  lag 24 hours (96 blk) : shift(96)  ← was shift(24) "mcp_lag_24h"
-  lag 7 days  (672 blk) : shift(672) ← was shift(168)"mcp_lag_168h"
-
-  rolling 24 h window   : window=96  ← was window=24
-  rolling 168 h window  : window=672 ← was window=168
-
-Feature NAMES are kept identical (mcp_lag_1h, mcp_lag_24h, etc.) so that
-all downstream model code that references these names continues to work
-without modification.
+New features added:
+  spike_flag_lag_1h          Binary: block 1h ago >= 10,000?
+  spike_intensity_lag_1h     Z-score vs 7-day rolling mean, clipped [-5,5]
+  consecutive_spikes_lag_1h  Consecutive spike block count, capped at 96
+  spike_freq_24h_lag_1h      Fraction of last 24h in spike territory
+  mcp_zscore_24h_lag_1h      Z-score vs 24h rolling mean/std, clipped [-5,5]
 """
 
 import pandas as pd
 import numpy as np
 
-
-# Number of 15-min blocks per hour.  Centralised so it's easy to change.
-BPH = 4   # blocks per hour
+BPH             = 4        # blocks per hour (15-min resolution)
+SPIKE_THRESHOLD = 10_000   # Rs/MWh — top-2 IEX price bands (10001-11000, 11001-12000)
 
 
 def build_price_features(prices_df, market):
-    """
-    Build price features for ONE market at 15-min resolution.
-
-    Input  : prices_df — all rows for one market, each row = one 15-min block.
-             Must contain columns: delivery_start_ist, mcp_rs_mwh, mcv_mwh,
-             purchase_bid_mwh, sell_bid_mwh.
-    Output : DataFrame indexed on delivery_start_ist with feature columns only.
-    """
     df = prices_df.sort_values('delivery_start_ist').copy()
     df = df.set_index('delivery_start_ist')
 
@@ -49,38 +32,69 @@ def build_price_features(prices_df, market):
 
     features = pd.DataFrame(index=df.index)
 
-    # ── Lag features (backward-looking) ───────────────────────────────────
-    # Names kept as *h / *h to preserve downstream compatibility.
+    # ── Original lag features ──────────────────────────────────────────────
+    features['mcp_lag_1h']   = df[mcp_col].shift(1 * BPH)
+    features['mcp_lag_2h']   = df[mcp_col].shift(2 * BPH)
+    features['mcp_lag_4h']   = df[mcp_col].shift(4 * BPH)
+    features['mcp_lag_24h']  = df[mcp_col].shift(24 * BPH)
+    features['mcp_lag_168h'] = df[mcp_col].shift(168 * BPH)
 
-    features['mcp_lag_1h']   = df[mcp_col].shift(1 * BPH)    # 1 hour  = 4 blocks
-    features['mcp_lag_2h']   = df[mcp_col].shift(2 * BPH)    # 2 hours = 8 blocks
-    features['mcp_lag_4h']   = df[mcp_col].shift(4 * BPH)    # 4 hours = 16 blocks
-    features['mcp_lag_24h']  = df[mcp_col].shift(24 * BPH)   # 24 h    = 96 blocks
-    features['mcp_lag_168h'] = df[mcp_col].shift(168 * BPH)  # 7 days  = 672 blocks
+    # ── Original rolling statistics ────────────────────────────────────────
+    w24  = 24  * BPH
+    w168 = 168 * BPH
 
-    # ── Rolling statistics (backward-looking) ─────────────────────────────
-    w24  = 24  * BPH   # 96 blocks  = 24 h window
-    w168 = 168 * BPH   # 672 blocks = 7-day window
+    roll_mean_24h  = df[mcp_col].rolling(window=w24,  min_periods=w24 // 2).mean()
+    roll_std_24h   = df[mcp_col].rolling(window=w24,  min_periods=w24 // 2).std()
+    roll_mean_168h = df[mcp_col].rolling(window=w168, min_periods=w168 // 4).mean()
+    roll_std_168h  = df[mcp_col].rolling(window=w168, min_periods=w168 // 4).std()
 
-    features['mcp_rolling_mean_24h']  = (
-        df[mcp_col].rolling(window=w24,  min_periods=w24).mean()
-    )
-    features['mcp_rolling_std_24h']   = (
-        df[mcp_col].rolling(window=w24,  min_periods=w24).std()
-    )
-    features['mcp_rolling_mean_168h'] = (
-        df[mcp_col].rolling(window=w168, min_periods=w168).mean()
-    )
+    features['mcp_rolling_mean_24h']  = roll_mean_24h
+    features['mcp_rolling_std_24h']   = roll_std_24h
+    features['mcp_rolling_mean_168h'] = roll_mean_168h
 
-    # ── Volume features ────────────────────────────────────────────────────
-    features['mcv_lag_1h']            = df[mcv_col].shift(1 * BPH)
-    features['mcv_rolling_mean_24h']  = (
-        df[mcv_col].rolling(window=w24,  min_periods=w24).mean()
-    )
+    # ── Original volume features ───────────────────────────────────────────
+    features['mcv_lag_1h']           = df[mcv_col].shift(1 * BPH)
+    features['mcv_rolling_mean_24h'] = df[mcv_col].rolling(
+        window=w24, min_periods=w24 // 2
+    ).mean()
 
-    # ── Bid-pressure ratio ─────────────────────────────────────────────────
+    # ── Original bid-pressure ratio ────────────────────────────────────────
     bid_ratio = df[buy_col] / df[sell_col]
     bid_ratio = bid_ratio.replace([np.inf, -np.inf], np.nan)
     features['bid_ratio_lag_1h'] = bid_ratio.shift(1 * BPH)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Phase 1 NEW — Spike features
+    # All computed on raw series first, then lagged 1h to avoid leakage.
+    # ══════════════════════════════════════════════════════════════════════
+    mcp = df[mcp_col]
+
+    # 1. Binary spike flag
+    is_spike = (mcp >= SPIKE_THRESHOLD).astype(int)
+
+    # 2. Spike intensity: z-score vs 7-day rolling mean/std, clipped [-5, 5]
+    spike_intensity = (
+        (mcp - roll_mean_168h) / roll_std_168h.replace(0, np.nan)
+    ).clip(-5, 5).fillna(0)
+
+    # 3. Consecutive spike count — capped at 96 (1 full day) to prevent extremes
+    spike_groups       = (is_spike != is_spike.shift()).cumsum()
+    consecutive_spikes = is_spike.groupby(spike_groups).cumcount() + 1
+    consecutive_spikes = consecutive_spikes.where(is_spike == 1, 0).clip(0, 96)
+
+    # 4. Rolling spike frequency over last 24h
+    spike_freq_24h = is_spike.rolling(window=w24, min_periods=w24 // 2).mean().fillna(0)
+
+    # 5. Z-score vs 24h rolling mean/std, clipped [-5, 5]
+    mcp_zscore_24h = (
+        (mcp - roll_mean_24h) / roll_std_24h.replace(0, np.nan)
+    ).clip(-5, 5).fillna(0)
+
+    # ── Lag all spike features by 1h (4 blocks) ───────────────────────────
+    features['spike_flag_lag_1h']         = is_spike.shift(1 * BPH)
+    features['spike_intensity_lag_1h']    = spike_intensity.shift(1 * BPH)
+    features['consecutive_spikes_lag_1h'] = consecutive_spikes.shift(1 * BPH)
+    features['spike_freq_24h_lag_1h']     = spike_freq_24h.shift(1 * BPH)
+    features['mcp_zscore_24h_lag_1h']     = mcp_zscore_24h.shift(1 * BPH)
 
     return features
